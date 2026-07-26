@@ -53,6 +53,7 @@ function Package {
         ErrorAction = 'SilentlyContinue'
         Path = @(
             "${ProjectRoot}/release/${ProductName}-*-windows-*.zip"
+            "${ProjectRoot}/release-portable/${ProductName}-*-windows-*.zip"
         )
     }
 
@@ -63,6 +64,42 @@ function Package {
         Path = (Get-ChildItem -Path "${ProjectRoot}/release/${Configuration}" -Exclude "${OutputName}*.*")
         CompressionLevel = 'Optimal'
         DestinationPath = "${ProjectRoot}/release/${OutputName}.zip"
+        Verbose = ($Env:CI -ne $null)
+    }
+    Compress-Archive -Force @CompressArgs
+    Log-Group
+
+    Log-Group "Archiving portable ${ProductName}..."
+
+    $InstallRoot = "${ProjectRoot}/release/${Configuration}/${ProductName}"
+    $PortableRoot = "${ProjectRoot}/release-portable/${Configuration}"
+
+    if ( ! ( Test-Path -Path "${InstallRoot}/bin" ) ) {
+        throw "No packaged binaries found at ${InstallRoot}/bin"
+    }
+
+    if ( Test-Path -Path $PortableRoot ) {
+        Remove-Item -Path $PortableRoot -Recurse -Force
+    }
+
+    # Portable OBS installations expect plugins in obs-plugins/64bit and their
+    # resources in data/obs-plugins/<plugin name>, so the packaged install tree
+    # is rearranged into that layout before it is archived.
+    $PortableBinaryDir = "${PortableRoot}/obs-plugins"
+    $PortableDataDir = "${PortableRoot}/data/obs-plugins/${ProductName}"
+
+    New-Item -ItemType Directory -Force -Path $PortableBinaryDir, $PortableDataDir | Out-Null
+
+    Copy-Item -Path "${InstallRoot}/bin/*" -Destination $PortableBinaryDir -Recurse -Force
+
+    if ( Test-Path -Path "${InstallRoot}/data" ) {
+        Copy-Item -Path "${InstallRoot}/data/*" -Destination $PortableDataDir -Recurse -Force
+    }
+
+    $CompressArgs = @{
+        Path = (Get-ChildItem -Path $PortableRoot)
+        CompressionLevel = 'Optimal'
+        DestinationPath = "${ProjectRoot}/release-portable/${OutputName}-Portable.zip"
         Verbose = ($Env:CI -ne $null)
     }
     Compress-Archive -Force @CompressArgs
