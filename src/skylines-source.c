@@ -335,36 +335,6 @@ static uint32_t csky_height(void *data)
 	return s->height;
 }
 
-static bool csky_variation_modified(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
-{
-	UNUSED_PARAMETER(p);
-	/* The variation sliders set how far the roofline and slot borders can
-	 * stray, which fixes the shortest/narrowest building each can produce.
-	 * A minimum below that natural floor changes nothing, so clamp each
-	 * Minimum slider's travel to the range where it actually has effect. */
-	double hv = obs_data_get_double(settings, "height_variation");
-	if (hv < 0.0)
-		hv = 0.0;
-	if (hv > 1.0)
-		hv = 1.0;
-	obs_property_t *pp = obs_properties_get(props, "min_height");
-	if (pp)
-		obs_property_float_set_limits(pp, 0.55 - 0.4 * hv, 0.95, 0.01);
-
-	double wv = obs_data_get_double(settings, "width_variation");
-	if (wv < 0.0)
-		wv = 0.0;
-	if (wv > 1.0)
-		wv = 1.0;
-	double w_floor = 1.0 - 0.9 * wv;
-	if (w_floor < 0.1)
-		w_floor = 0.1;
-	pp = obs_properties_get(props, "min_width");
-	if (pp)
-		obs_property_float_set_limits(pp, w_floor, 1.0, 0.01);
-	return true;
-}
-
 static bool csky_drift_modified(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
 {
 	UNUSED_PARAMETER(p);
@@ -399,16 +369,23 @@ static obs_properties_t *csky_props_common(bool is_filter)
 
 	obs_properties_t *buildings = obs_properties_create();
 	obs_properties_add_int_slider(buildings, "seed", obs_module_text("Constellations.Skyline.Seed"), 0, 10000, 1);
-	obs_property_t *hv = obs_properties_add_float_slider(buildings, "height_variation",
-							     obs_module_text("Constellations.Skyline.HeightVariation"),
-							     0.0, 1.0, 0.01);
-	obs_property_set_modified_callback(hv, csky_variation_modified);
+	/* The variation sliders deliberately carry no modified callback. A
+	 * callback that returns true makes OBS tear down and rebuild every
+	 * widget in the dialog, and these are dragged continuously, so it fired
+	 * on every step of the drag: the properties view stuttered and the
+	 * rebuild destroyed the slider mid-drag, breaking the grab. The
+	 * Minimum sliders therefore keep fixed limits covering their full
+	 * useful travel, and the shader clamps each one against the floor the
+	 * matching variation implies (max() for min_height, min() for
+	 * min_width), so a minimum below that floor is a no-op rather than a
+	 * wrong result. */
+	obs_properties_add_float_slider(buildings, "height_variation",
+					obs_module_text("Constellations.Skyline.HeightVariation"), 0.0, 1.0, 0.01);
 	obs_property_t *mh = obs_properties_add_float_slider(
 		buildings, "min_height", obs_module_text("Constellations.Skyline.MinHeight"), 0.0, 0.95, 0.01);
 	obs_property_set_long_description(mh, obs_module_text("Constellations.Skyline.MinHeight.Desc"));
-	obs_property_t *wv = obs_properties_add_float_slider(
-		buildings, "width_variation", obs_module_text("Constellations.Skyline.WidthVariation"), 0.0, 1.0, 0.01);
-	obs_property_set_modified_callback(wv, csky_variation_modified);
+	obs_properties_add_float_slider(buildings, "width_variation",
+					obs_module_text("Constellations.Skyline.WidthVariation"), 0.0, 1.0, 0.01);
 	obs_property_t *mw = obs_properties_add_float_slider(
 		buildings, "min_width", obs_module_text("Constellations.Skyline.MinWidth"), 0.1, 1.0, 0.01);
 	obs_property_set_long_description(mw, obs_module_text("Constellations.Skyline.MinWidth.Desc"));
