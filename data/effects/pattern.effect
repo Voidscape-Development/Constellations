@@ -244,14 +244,20 @@ float2 cell_local_at(float2 frag_px, int dcol, int drow, out float2 cell_id)
 	float lp = m_perp - row * cs;
 
 	if (drift_loc_amt > 0.0) {
-		// Animated wander: each cell's shape roams a Lissajous path around
-		// the cell center with its own random phase and rate. The slider
-		// sets how far it travels (up to drift_loc_amt * cell in each axis).
+		// Animated wander: each cell's shape roams around the cell center
+		// as the sum of two counter-rotating circles, each with its own
+		// random phase and rate. Independent per-axis sines would trace a
+		// square Lissajous that lingers in its corners, so shapes favored
+		// the diagonals and reached ~1.4x farther along them; this path
+		// stays inside a disc of radius drift_loc_amt * cell and spends
+		// equal time in every direction.
 		float2 ph = hash22(float2(col, row) + 0.5, item_seed) * 6.2831853;
 		float2 rate = hash22(float2(col, row) + 17.9, item_seed + 4.7) + 0.5;
-		float amp = drift_loc_amt * cs;
-		la -= sin(elapsed_time * rate.x + ph.x) * amp;
-		lp -= sin(elapsed_time * rate.y + ph.y) * amp;
+		float amp = drift_loc_amt * cs * 0.5;
+		float a1 = elapsed_time * rate.x + ph.x;
+		float a2 = ph.y - elapsed_time * rate.y;
+		la -= (cos(a1) + cos(a2)) * amp;
+		lp -= (sin(a1) + sin(a2)) * amp;
 	}
 
 	cell_id = float2(col, row);
