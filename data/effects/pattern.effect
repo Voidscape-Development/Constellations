@@ -14,6 +14,16 @@ uniform int polygon_sides;
 uniform float stroke_thickness;
 uniform float outline_only;
 uniform float image_color_mode; // images: 0 original, 1 tint (multiply), 2 recolor (solid)
+uniform float tex_aspect;       // images: texture width / height (1 = stretch to square)
+
+uniform float color_variation;  // 1 = each cell picks shape_color, color_b or color_c
+uniform float4 color_b;
+uniform float4 color_c;
+
+uniform float4 bg_color;
+uniform float4 bg_color2;
+uniform float bg_type;          // 0 solid, 1 radial, 2 linear
+uniform float2 bg_dir;          // linear gradient direction (cos, sin)
 
 uniform float2 lattice_dir;    // canvas rotation axes (cos, sin)
 uniform float2 motion_offset;  // accumulated motion in lattice coords (along, perp) px
@@ -306,6 +316,20 @@ float twinkle_alpha_calc(float2 cell_id)
 	return sin(elapsed_time * twinkle_speed * 6.2831853 * rate + ph) * 0.5 + 0.5;
 }
 
+// Per-cell color for Random Color Per Cell. Only the rgb varies; alpha
+// (shape opacity) always comes from shape_color.
+float3 cell_rgb(float2 cell_id)
+{
+	if (color_variation < 0.5)
+		return shape_color.rgb;
+	float pick = floor(hash11(cell_id + 53.1, item_seed + 9.37) * 3.0);
+	if (pick < 0.5)
+		return shape_color.rgb;
+	if (pick < 1.5)
+		return color_b.rgb;
+	return color_c.rgb;
+}
+
 // Per-cell rotation for the Auto Rotation effect, added on top of the item's
 // static rotation. Every cell always gets its own random angle (reshuffled by
 // the seed); Unison style additionally spins all cells together at the shared
@@ -338,12 +362,14 @@ float4 PSShape(VertData v_in) : TARGET
 	int reach = tile_reach();
 	float stroke_w = max(stroke_thickness, 0.001) * shape_size;
 	float alpha;
+	float2 color_cid = float2(0.0, 0.0);
 	if (twinkle_amount > 0.001) {
 		// Twinkle needs a per-cell fade, so coverage is computed per
 		// instance and combined with max() instead of taking the union
 		// SDF. The SDFs are true pixel distances, so a fixed ~0.75 px
 		// smoothing gives the same anti-aliasing as the fwidth path.
 		alpha = 0.0;
+		float best_a = -1.0;
 		for (int dr = -reach; dr <= reach; ++dr) {
 			for (int dc = -reach; dc <= reach; ++dc) {
 				float2 cid;
@@ -355,7 +381,15 @@ float4 PSShape(VertData v_in) : TARGET
 				if (outline_only > 0.5)
 					d = abs(d) - stroke_w * 0.5;
 				float a = 1.0 - smoothstep(-0.75, 0.75, d);
-				alpha = max(alpha, a * twinkle_alpha_calc(cid));
+				float ta = a * twinkle_alpha_calc(cid);
+				// Color follows the instance with the largest
+				// raw coverage so a faded-out neighbor never
+				// steals the color of the visible shape.
+				if (a > best_a) {
+					best_a = a;
+					color_cid = cid;
+				}
+				alpha = max(alpha, ta);
 			}
 		}
 	} else {
@@ -368,7 +402,10 @@ float4 PSShape(VertData v_in) : TARGET
 					continue;
 				p = rotate2(p, shape_rotation + auto_rot_angle(cid));
 				float d = shape_sdf(p);
-				best_d = min(best_d, d);
+				if (d < best_d) {
+					best_d = d;
+					color_cid = cid;
+				}
 			}
 		}
 		if (outline_only > 0.5) {
@@ -387,14 +424,19 @@ float4 PSShape(VertData v_in) : TARGET
 		alpha = 1.0 - smoothstep(-edge, edge, best_d);
 	}
 	alpha *= vignette_mask_calc(frag_px);
-	return float4(shape_color.rgb, shape_color.a * alpha);
+	return float4(cell_rgb(color_cid), shape_color.a * alpha);
 }
 
 float4 PSImage(VertData v_in) : TARGET
 {
 	float2 frag_px = v_in.uv * canvas_size;
 	int reach = tile_reach();
-	float half_size = shape_size * 0.5;
+	// Fit the texture inside the shape_size square, keeping its aspect.
+	float2 half_ext = float2(shape_size, shape_size) * 0.5;
+	if (tex_aspect >= 1.0)
+		half_ext.y /= tex_aspect;
+	else
+		half_ext.x *= tex_aspect;
 
 	float best_dist2 = 1.0e12;
 	float2 best_p = float2(0.0, 0.0);
@@ -407,7 +449,7 @@ float4 PSImage(VertData v_in) : TARGET
 			if (!cell_belongs_to_this_item(cid))
 				continue;
 			p = rotate2(p, shape_rotation + auto_rot_angle(cid));
-			if (abs(p.x) <= half_size && abs(p.y) <= half_size) {
+			if (abs(p.x) <= half_ext.x && abs(p.y) <= half_ext.y) {
 				float d2 = dot(p, p);
 				if (d2 < best_dist2) {
 					best_dist2 = d2;
@@ -420,19 +462,50 @@ float4 PSImage(VertData v_in) : TARGET
 	}
 	if (found < 0.5)
 		return float4(0.0, 0.0, 0.0, 0.0);
-	float2 uv = (best_p / shape_size) + 0.5;
+	float2 uv = best_p / (half_ext * 2.0) + 0.5;
 	float4 tex = cell_texture.Sample(TileSampler, uv);
 	// shape_color carries the tint color and, in alpha, the item opacity.
 	// Opacity only scales alpha: the SRCALPHA blend already weights rgb by
 	// it, so scaling rgb as well would darken semi-transparent items.
+	float3 tint = cell_rgb(best_cid);
 	if (image_color_mode > 1.5)
-		tex.rgb = shape_color.rgb;
+		tex.rgb = tint;
 	else if (image_color_mode > 0.5)
-		tex.rgb *= shape_color.rgb;
+		tex.rgb *= tint;
 	tex.a *= shape_color.a * vignette_mask_calc(frag_px);
 	if (twinkle_amount > 0.001)
 		tex.a *= twinkle_alpha_calc(best_cid);
 	return tex;
+}
+
+float4 PSBackground(VertData v_in) : TARGET
+{
+	float2 px = v_in.uv * canvas_size;
+	float2 half_canvas = canvas_size * 0.5;
+	if (bg_type < 0.5)
+		return bg_color;
+	float t;
+	if (bg_type < 1.5) {
+		// Radial: center of the canvas out to its corners.
+		t = length(px - half_canvas) / max(length(half_canvas), 1.0);
+	} else {
+		// Linear: spans the canvas exactly along bg_dir.
+		float extent = abs(bg_dir.x) * half_canvas.x + abs(bg_dir.y) * half_canvas.y;
+		t = dot(px - half_canvas, bg_dir) / max(2.0 * extent, 1.0) + 0.5;
+	}
+	float4 c = lerp(bg_color, bg_color2, saturate(t));
+	// Dark gradients band visibly in 8-bit output; one LSB of noise hides it.
+	c.rgb += (hash11(floor(px), 0.0) - 0.5) / 255.0;
+	return c;
+}
+
+technique DrawBackground
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSBackground(v_in);
+	}
 }
 
 technique DrawShape
