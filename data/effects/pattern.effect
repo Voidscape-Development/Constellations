@@ -13,6 +13,7 @@ uniform int shape_kind;
 uniform int polygon_sides;
 uniform float stroke_thickness;
 uniform float outline_only;
+uniform float image_color_mode; // images: 0 original, 1 tint (multiply), 2 recolor (solid)
 
 uniform float2 lattice_dir;    // canvas rotation axes (cos, sin)
 uniform float2 motion_offset;  // accumulated motion in lattice coords (along, perp) px
@@ -421,10 +422,16 @@ float4 PSImage(VertData v_in) : TARGET
 		return float4(0.0, 0.0, 0.0, 0.0);
 	float2 uv = (best_p / shape_size) + 0.5;
 	float4 tex = cell_texture.Sample(TileSampler, uv);
+	// shape_color carries the tint color and, in alpha, the item opacity.
+	// Opacity only scales alpha: the SRCALPHA blend already weights rgb by
+	// it, so scaling rgb as well would darken semi-transparent items.
+	if (image_color_mode > 1.5)
+		tex.rgb = shape_color.rgb;
+	else if (image_color_mode > 0.5)
+		tex.rgb *= shape_color.rgb;
 	tex.a *= shape_color.a * vignette_mask_calc(frag_px);
 	if (twinkle_amount > 0.001)
 		tex.a *= twinkle_alpha_calc(best_cid);
-	tex.rgb *= shape_color.a;
 	return tex;
 }
 

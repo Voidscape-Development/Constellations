@@ -28,6 +28,15 @@ enum constellations_item_kind {
 	CITEM_SOURCE = 2,
 };
 
+/* How Image and Source items are colored. Tint multiplies the texture by the
+ * chosen color (keeps shading); Recolor replaces it outright and keeps only
+ * the alpha, which suits single-color icons and SVGs. */
+enum constellations_image_color_mode {
+	CIMGCOLOR_ORIGINAL = 0,
+	CIMGCOLOR_TINT = 1,
+	CIMGCOLOR_RECOLOR = 2,
+};
+
 enum constellations_vignette_shape {
 	CVIGN_CIRCLE = 0,
 	CVIGN_LINEAR = 1,

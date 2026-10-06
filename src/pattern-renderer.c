@@ -9,6 +9,7 @@ the Free Software Foundation; either version 2 of the License, or
 */
 
 #include "pattern-renderer.h"
+#include "svg-image.h"
 
 #include <obs-module.h>
 #include <plugin-support.h>
@@ -21,6 +22,9 @@ the Free Software Foundation; either version 2 of the License, or
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+/* Gold (#D4AF37) in OBS's 0xAABBGGRR color layout. */
+#define CPAT_GOLD 0xFF37AFD4
 
 static void cpat_item_release_source(struct cpat_item *it)
 {
@@ -38,7 +42,18 @@ static void cpat_item_release_source(struct cpat_item *it)
 
 static void cpat_item_release_image(struct cpat_item *it)
 {
-	if (it->image_loaded) {
+	if (it->svg) {
+		if (it->svg_texture) {
+			obs_enter_graphics();
+			gs_texture_destroy(it->svg_texture);
+			obs_leave_graphics();
+			it->svg_texture = NULL;
+		}
+		it->svg_px = 0;
+		cpat_svg_free(it->svg);
+		it->svg = NULL;
+		it->image_loaded = false;
+	} else if (it->image_loaded) {
 		obs_enter_graphics();
 		gs_image_file_free(&it->image);
 		obs_leave_graphics();
@@ -46,11 +61,51 @@ static void cpat_item_release_image(struct cpat_item *it)
 	}
 }
 
+/* Rasterizes the item's SVG at its current size. The pixel size is rounded
+ * up to a multiple of 32 so dragging the size slider only re-rasterizes
+ * every few steps instead of on every tick. */
+static void cpat_item_refresh_svg(struct cpat_item *it)
+{
+	if (!it->svg)
+		return;
+	uint32_t px = ((uint32_t)ceilf(it->size) + 31u) & ~31u;
+	if (px < 32)
+		px = 32;
+	if (px > 2048)
+		px = 2048;
+	if (px == it->svg_px && it->svg_texture)
+		return;
+	uint8_t *data = cpat_svg_rasterize(it->svg, px);
+	if (!data)
+		return;
+	const uint8_t *planes[] = {data};
+	obs_enter_graphics();
+	if (it->svg_texture)
+		gs_texture_destroy(it->svg_texture);
+	it->svg_texture = gs_texture_create(px, px, GS_RGBA, 1, planes, 0);
+	obs_leave_graphics();
+	bfree(data);
+	it->svg_px = it->svg_texture ? px : 0;
+}
+
+static gs_texture_t *cpat_item_image_texture(struct cpat_item *it)
+{
+	if (!it->image_loaded)
+		return NULL;
+	return it->svg ? it->svg_texture : it->image.texture;
+}
+
 static void cpat_item_acquire_image(struct cpat_item *it)
 {
 	cpat_item_release_image(it);
 	if (!it->image_path || !*it->image_path)
 		return;
+	if (cpat_svg_is_svg_path(it->image_path)) {
+		it->svg = cpat_svg_load(it->image_path);
+		it->image_loaded = it->svg != NULL;
+		cpat_item_refresh_svg(it);
+		return;
+	}
 	gs_image_file_init(&it->image, it->image_path);
 	obs_enter_graphics();
 	gs_image_file_init_texture(&it->image);
@@ -125,7 +180,8 @@ void cpat_renderer_set_defaults(obs_data_t *settings, bool include_canvas)
 	if (include_canvas) {
 		obs_data_set_default_int(settings, "width", 1920);
 		obs_data_set_default_int(settings, "height", 1080);
-		obs_data_set_default_int(settings, "background_color", 0xFF101820);
+		/* Charcoal (#1C1C1F); OBS stores colors as 0xAABBGGRR. */
+		obs_data_set_default_int(settings, "background_color", 0xFF1F1C1C);
 	} else {
 		obs_data_set_default_int(settings, "background_color", 0x00000000);
 	}
@@ -136,17 +192,25 @@ void cpat_renderer_set_defaults(obs_data_t *settings, bool include_canvas)
 	obs_data_set_default_int(settings, "layout_mode", CLAYOUT_LAYERED);
 	obs_data_set_default_int(settings, "grid_order", CGRID_RANDOM);
 
+	/* The standalone source starts as slowly drifting, twinkling gold stars
+	 * on charcoal; the filter keeps plain white dots over the video. */
+	const int default_shape = include_canvas ? CSHAPE_STAR : CSHAPE_CIRCLE;
+	const long long default_color = include_canvas ? CPAT_GOLD : 0xFFFFFFFF;
+
 	for (int i = 0; i < CONSTELLATIONS_MAX_ITEMS; ++i) {
 		char key[64];
 #define DK(name) (snprintf(key, sizeof(key), "item_%d_%s", i + 1, name), key)
 		obs_data_set_default_bool(settings, DK("enabled"), i == 0);
 		obs_data_set_default_int(settings, DK("kind"), CITEM_SHAPE);
-		obs_data_set_default_int(settings, DK("shape"), CSHAPE_CIRCLE);
+		obs_data_set_default_int(settings, DK("shape"), default_shape);
 		obs_data_set_default_int(settings, DK("polygon_sides"), 6);
 		obs_data_set_default_double(settings, DK("stroke_thickness"), 0.2);
 		obs_data_set_default_bool(settings, DK("outline_only"), false);
-		obs_data_set_default_int(settings, DK("color"), 0xFFFFFFFF);
+		obs_data_set_default_int(settings, DK("color"), default_color);
 		obs_data_set_default_string(settings, DK("image_path"), "");
+		obs_data_set_default_int(settings, DK("image_color_mode"), CIMGCOLOR_ORIGINAL);
+		obs_data_set_default_int(settings, DK("image_tint"), CPAT_GOLD);
+		obs_data_set_default_double(settings, DK("image_opacity"), 100.0);
 		obs_data_set_default_string(settings, DK("source_name"), "");
 		obs_data_set_default_double(settings, DK("size"), 24.0);
 		obs_data_set_default_double(settings, DK("rotation"), 0.0);
@@ -165,17 +229,17 @@ void cpat_renderer_set_defaults(obs_data_t *settings, bool include_canvas)
 #undef DK
 	}
 
-	obs_data_set_default_double(settings, "motion_angle", 0.0);
-	obs_data_set_default_double(settings, "motion_speed", 0.0);
+	obs_data_set_default_double(settings, "motion_angle", include_canvas ? 315.0 : 0.0);
+	obs_data_set_default_double(settings, "motion_speed", include_canvas ? 12.0 : 0.0);
 	obs_data_set_default_bool(settings, "alternating_lines", false);
 	obs_data_set_default_bool(settings, "speed_drift", false);
 	obs_data_set_default_double(settings, "speed_drift_amount", 0.25);
 	obs_data_set_default_bool(settings, "location_drift", false);
 	obs_data_set_default_double(settings, "location_drift_amount", 0.15);
 
-	obs_data_set_default_bool(settings, "twinkle_enabled", false);
-	obs_data_set_default_double(settings, "twinkle_amount", 0.5);
-	obs_data_set_default_double(settings, "twinkle_speed", 1.0);
+	obs_data_set_default_bool(settings, "twinkle_enabled", include_canvas);
+	obs_data_set_default_double(settings, "twinkle_amount", include_canvas ? 0.3 : 0.5);
+	obs_data_set_default_double(settings, "twinkle_speed", include_canvas ? 0.5 : 1.0);
 
 	obs_data_set_default_bool(settings, "autorot_enabled", false);
 	obs_data_set_default_double(settings, "autorot_speed", 45.0);
@@ -275,6 +339,12 @@ static void apply_item_kind_visibility(obs_properties_t *props, obs_data_t *sett
 	VIS("color", kind == CITEM_SHAPE);
 	VIS("image_path", kind == CITEM_IMAGE);
 	VIS("source_name", kind == CITEM_SOURCE);
+	bool textured = kind == CITEM_IMAGE || kind == CITEM_SOURCE;
+	snprintf(key, sizeof(key), "item_%d_image_color_mode", i + 1);
+	bool tinted = (int)obs_data_get_int(settings, key) != CIMGCOLOR_ORIGINAL;
+	VIS("image_color_mode", textured);
+	VIS("image_tint", textured && tinted);
+	VIS("image_opacity", textured);
 #undef VIS
 }
 
@@ -336,10 +406,11 @@ static void apply_item_enabled_visibility(obs_properties_t *props, obs_data_t *s
 	char key[64];
 	snprintf(key, sizeof(key), "item_%d_enabled", i + 1);
 	bool en = obs_data_get_bool(settings, key);
-	const char *names[] = {"kind",        "shape",      "outline_only", "polygon_sides", "stroke_thickness",
-			       "color",       "image_path", "source_name",  "size",          "rotation",
-			       "offset_x",    "offset_y",   "density",      "twinkle_mode",  "speed_drift_mode",
-			       "autorot_mode"};
+	const char *names[] = {
+		"kind",          "shape",        "outline_only",     "polygon_sides",    "stroke_thickness",
+		"color",         "image_path",   "source_name",      "image_color_mode", "image_tint",
+		"image_opacity", "size",         "rotation",         "offset_x",         "offset_y",
+		"density",       "twinkle_mode", "speed_drift_mode", "autorot_mode"};
 	for (size_t k = 0; k < sizeof(names) / sizeof(names[0]); ++k) {
 		snprintf(key, sizeof(key), "item_%d_%s", i + 1, names[k]);
 		obs_property_t *pp = obs_properties_get(props, key);
@@ -601,12 +672,26 @@ static void add_item_group(obs_properties_t *root, struct cpat_renderer *r, int 
 
 	snprintf(key, sizeof(key), "item_%d_image_path", i + 1);
 	obs_properties_add_path(grp, key, obs_module_text("Constellations.Item.ImagePath"), OBS_PATH_FILE,
-				"Images (*.png *.jpg *.jpeg *.bmp *.tga *.gif);;All Files (*.*)", NULL);
+				"Images (*.png *.jpg *.jpeg *.bmp *.tga *.gif *.svg);;SVG (*.svg);;All Files (*.*)",
+				NULL);
 
 	snprintf(key, sizeof(key), "item_%d_source_name", i + 1);
 	obs_property_t *src = obs_properties_add_list(grp, key, obs_module_text("Constellations.Item.Source"),
 						      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	fill_source_dropdown(src, r ? r->owner : NULL);
+
+	snprintf(key, sizeof(key), "item_%d_image_color_mode", i + 1);
+	obs_property_t *icm = obs_properties_add_list(grp, key, obs_module_text("Constellations.Item.ImageColor"),
+						      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(icm, obs_module_text("Constellations.Item.ImageColor.Original"), CIMGCOLOR_ORIGINAL);
+	obs_property_list_add_int(icm, obs_module_text("Constellations.Item.ImageColor.Tint"), CIMGCOLOR_TINT);
+	obs_property_list_add_int(icm, obs_module_text("Constellations.Item.ImageColor.Recolor"), CIMGCOLOR_RECOLOR);
+	obs_property_set_long_description(icm, obs_module_text("Constellations.Item.ImageColor.Tooltip"));
+	obs_property_set_modified_callback(icm, item_kind_modified);
+	snprintf(key, sizeof(key), "item_%d_image_tint", i + 1);
+	obs_properties_add_color(grp, key, obs_module_text("Constellations.Item.ImageTint"));
+	snprintf(key, sizeof(key), "item_%d_image_opacity", i + 1);
+	obs_properties_add_float_slider(grp, key, obs_module_text("Constellations.Item.ImageOpacity"), 0.0, 100.0, 1.0);
 
 	snprintf(key, sizeof(key), "item_%d_size", i + 1);
 	obs_properties_add_float_slider(grp, key, obs_module_text("Constellations.Item.Size"), 1.0, 1024.0, 1.0);
@@ -831,9 +916,14 @@ static void cpat_item_update(struct cpat_item *it, obs_data_t *settings, int ind
 		cpat_item_release_source(it);
 	}
 
+	it->image_color_mode = (int)obs_data_get_int(settings, IK("image_color_mode"));
+	vec4_from_rgba(&it->image_tint, (uint32_t)obs_data_get_int(settings, IK("image_tint")));
+	it->image_opacity = (float)obs_data_get_double(settings, IK("image_opacity")) / 100.0f;
+
 	it->size = (float)obs_data_get_double(settings, IK("size"));
 	if (it->size < 1.0f)
 		it->size = 1.0f;
+	cpat_item_refresh_svg(it);
 	it->rotation_deg = (float)obs_data_get_double(settings, IK("rotation"));
 	it->offset_x = (float)obs_data_get_double(settings, IK("offset_x"));
 	it->offset_y = (float)obs_data_get_double(settings, IK("offset_y"));
@@ -1031,9 +1121,20 @@ static void set_common_uniforms(struct cpat_renderer *r, struct cpat_item *it, u
 	p = gs_effect_get_param_by_name(r->effect, "item_offset");
 	if (p)
 		gs_effect_set_vec2(p, &ioff);
+	/* Shapes use their own color. Images and sources pass the tint color
+	 * with the opacity slider as alpha; the shader decides how the tint
+	 * applies from image_color_mode. */
+	struct vec4 color = it->color;
+	if (it->kind != CITEM_SHAPE) {
+		color = it->image_tint;
+		color.w = it->image_opacity;
+	}
 	p = gs_effect_get_param_by_name(r->effect, "shape_color");
 	if (p)
-		gs_effect_set_vec4(p, &it->color);
+		gs_effect_set_vec4(p, &color);
+	p = gs_effect_get_param_by_name(r->effect, "image_color_mode");
+	if (p)
+		gs_effect_set_float(p, (float)it->image_color_mode);
 	p = gs_effect_get_param_by_name(r->effect, "shape_kind");
 	if (p)
 		gs_effect_set_int(p, it->shape);
@@ -1221,9 +1322,9 @@ void cpat_renderer_render_items(struct cpat_renderer *r, uint32_t w, uint32_t h)
 		gs_texture_t *tex = NULL;
 		const char *technique = "DrawShape";
 		if (it->kind == CITEM_IMAGE) {
-			if (!it->image_loaded || !it->image.texture)
+			tex = cpat_item_image_texture(it);
+			if (!tex)
 				continue;
-			tex = it->image.texture;
 			technique = "DrawImage";
 		} else if (it->kind == CITEM_SOURCE) {
 			if (!it->source_texrender)

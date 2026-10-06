@@ -26,6 +26,15 @@ struct cpat_item {
 	char *image_path;
 	gs_image_file_t image;
 	bool image_loaded;
+	int image_color_mode;
+	struct vec4 image_tint;
+	float image_opacity;
+
+	/* SVG images are kept as vector data and rasterized at the item's
+	 * size, so they stay sharp however large the item is drawn. */
+	struct NSVGimage *svg;
+	gs_texture_t *svg_texture;
+	uint32_t svg_px;
 
 	char *source_name;
 	obs_weak_source_t *source_ref;
