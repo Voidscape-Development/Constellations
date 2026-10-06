@@ -44,6 +44,11 @@ target_sources(
     src/skylines-source.c
     src/pattern-filter.c
     src/shapes-transition.c
+    src/svg-image.c
+    src/nanosvg-impl.c
 )
+
+target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/deps/nanosvg")
+set_source_files_properties(src/nanosvg-impl.c PROPERTIES COMPILE_OPTIONS "$<$<NOT:$<C_COMPILER_ID:MSVC>>:-w>")
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})

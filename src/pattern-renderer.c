@@ -9,6 +9,7 @@ the Free Software Foundation; either version 2 of the License, or
 */
 
 #include "pattern-renderer.h"
+#include "svg-image.h"
 
 #include <obs-module.h>
 #include <plugin-support.h>
@@ -21,6 +22,23 @@ the Free Software Foundation; either version 2 of the License, or
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+/* Colors in OBS's 0xAABBGGRR layout. */
+#define CPAT_GOLD 0xFF37AFD4      /* #D4AF37 */
+#define CPAT_CHAMPAGNE 0xFFCEE7F7 /* #F7E7CE */
+#define CPAT_IVORY 0xFFE7F8FF     /* #FFF8E7 */
+#define CPAT_CHARCOAL 0xFF1F1C1C  /* #1C1C1F */
+#define CPAT_NEAR_BLACK 0xFF0C0A0A /* #0A0A0C */
+
+/* Built-in SVGs shipped in data/images/<id>.svg. */
+static const char *const cpat_image_presets[][2] = {
+	{"sparkle", "Constellations.Item.ImagePreset.Sparkle"},
+	{"star4", "Constellations.Item.ImagePreset.Star4"},
+	{"moon", "Constellations.Item.ImagePreset.Moon"},
+	{"planet", "Constellations.Item.ImagePreset.Planet"},
+	{"snowflake", "Constellations.Item.ImagePreset.Snowflake"},
+	{"comet", "Constellations.Item.ImagePreset.Comet"},
+};
 
 static void cpat_item_release_source(struct cpat_item *it)
 {
@@ -38,7 +56,18 @@ static void cpat_item_release_source(struct cpat_item *it)
 
 static void cpat_item_release_image(struct cpat_item *it)
 {
-	if (it->image_loaded) {
+	if (it->svg) {
+		if (it->svg_texture) {
+			obs_enter_graphics();
+			gs_texture_destroy(it->svg_texture);
+			obs_leave_graphics();
+			it->svg_texture = NULL;
+		}
+		it->svg_px = 0;
+		cpat_svg_free(it->svg);
+		it->svg = NULL;
+		it->image_loaded = false;
+	} else if (it->image_loaded) {
 		obs_enter_graphics();
 		gs_image_file_free(&it->image);
 		obs_leave_graphics();
@@ -46,11 +75,51 @@ static void cpat_item_release_image(struct cpat_item *it)
 	}
 }
 
+/* Rasterizes the item's SVG at its current size. The pixel size is rounded
+ * up to a multiple of 32 so dragging the size slider only re-rasterizes
+ * every few steps instead of on every tick. */
+static void cpat_item_refresh_svg(struct cpat_item *it)
+{
+	if (!it->svg)
+		return;
+	uint32_t px = ((uint32_t)ceilf(it->size) + 31u) & ~31u;
+	if (px < 32)
+		px = 32;
+	if (px > 2048)
+		px = 2048;
+	if (px == it->svg_px && it->svg_texture)
+		return;
+	uint8_t *data = cpat_svg_rasterize(it->svg, px);
+	if (!data)
+		return;
+	const uint8_t *planes[] = {data};
+	obs_enter_graphics();
+	if (it->svg_texture)
+		gs_texture_destroy(it->svg_texture);
+	it->svg_texture = gs_texture_create(px, px, GS_RGBA, 1, planes, 0);
+	obs_leave_graphics();
+	bfree(data);
+	it->svg_px = it->svg_texture ? px : 0;
+}
+
+static gs_texture_t *cpat_item_image_texture(struct cpat_item *it)
+{
+	if (!it->image_loaded)
+		return NULL;
+	return it->svg ? it->svg_texture : it->image.texture;
+}
+
 static void cpat_item_acquire_image(struct cpat_item *it)
 {
 	cpat_item_release_image(it);
 	if (!it->image_path || !*it->image_path)
 		return;
+	if (cpat_svg_is_svg_path(it->image_path)) {
+		it->svg = cpat_svg_load(it->image_path);
+		it->image_loaded = it->svg != NULL;
+		cpat_item_refresh_svg(it);
+		return;
+	}
 	gs_image_file_init(&it->image, it->image_path);
 	obs_enter_graphics();
 	gs_image_file_init_texture(&it->image);
@@ -125,10 +194,16 @@ void cpat_renderer_set_defaults(obs_data_t *settings, bool include_canvas)
 	if (include_canvas) {
 		obs_data_set_default_int(settings, "width", 1920);
 		obs_data_set_default_int(settings, "height", 1080);
-		obs_data_set_default_int(settings, "background_color", 0xFF101820);
+		/* Charcoal center fading to near-black corners. */
+		obs_data_set_default_int(settings, "background_type", CBG_RADIAL);
+		obs_data_set_default_int(settings, "background_color", CPAT_CHARCOAL);
+		obs_data_set_default_int(settings, "background_color2", CPAT_NEAR_BLACK);
 	} else {
+		obs_data_set_default_int(settings, "background_type", CBG_SOLID);
 		obs_data_set_default_int(settings, "background_color", 0x00000000);
+		obs_data_set_default_int(settings, "background_color2", 0x00000000);
 	}
+	obs_data_set_default_double(settings, "background_angle", 90.0);
 	obs_data_set_default_double(settings, "anchor_x_pct", 50.0);
 	obs_data_set_default_double(settings, "anchor_y_pct", 50.0);
 	obs_data_set_default_double(settings, "canvas_rotation", 0.0);
@@ -136,17 +211,30 @@ void cpat_renderer_set_defaults(obs_data_t *settings, bool include_canvas)
 	obs_data_set_default_int(settings, "layout_mode", CLAYOUT_LAYERED);
 	obs_data_set_default_int(settings, "grid_order", CGRID_RANDOM);
 
+	/* The standalone source starts as slowly drifting, twinkling gold stars
+	 * on charcoal; the filter keeps plain white dots over the video. */
+	const int default_shape = include_canvas ? CSHAPE_STAR : CSHAPE_CIRCLE;
+	const long long default_color = include_canvas ? CPAT_GOLD : 0xFFFFFFFF;
+
 	for (int i = 0; i < CONSTELLATIONS_MAX_ITEMS; ++i) {
 		char key[64];
 #define DK(name) (snprintf(key, sizeof(key), "item_%d_%s", i + 1, name), key)
 		obs_data_set_default_bool(settings, DK("enabled"), i == 0);
 		obs_data_set_default_int(settings, DK("kind"), CITEM_SHAPE);
-		obs_data_set_default_int(settings, DK("shape"), CSHAPE_CIRCLE);
+		obs_data_set_default_int(settings, DK("shape"), default_shape);
 		obs_data_set_default_int(settings, DK("polygon_sides"), 6);
 		obs_data_set_default_double(settings, DK("stroke_thickness"), 0.2);
 		obs_data_set_default_bool(settings, DK("outline_only"), false);
-		obs_data_set_default_int(settings, DK("color"), 0xFFFFFFFF);
+		obs_data_set_default_int(settings, DK("color"), default_color);
+		obs_data_set_default_string(settings, DK("image_preset"), "");
 		obs_data_set_default_string(settings, DK("image_path"), "");
+		obs_data_set_default_bool(settings, DK("keep_aspect"), true);
+		obs_data_set_default_bool(settings, DK("random_colors"), false);
+		obs_data_set_default_int(settings, DK("color_b"), CPAT_CHAMPAGNE);
+		obs_data_set_default_int(settings, DK("color_c"), CPAT_IVORY);
+		obs_data_set_default_int(settings, DK("image_color_mode"), CIMGCOLOR_ORIGINAL);
+		obs_data_set_default_int(settings, DK("image_tint"), CPAT_GOLD);
+		obs_data_set_default_double(settings, DK("image_opacity"), 100.0);
 		obs_data_set_default_string(settings, DK("source_name"), "");
 		obs_data_set_default_double(settings, DK("size"), 24.0);
 		obs_data_set_default_double(settings, DK("rotation"), 0.0);
@@ -165,17 +253,17 @@ void cpat_renderer_set_defaults(obs_data_t *settings, bool include_canvas)
 #undef DK
 	}
 
-	obs_data_set_default_double(settings, "motion_angle", 0.0);
-	obs_data_set_default_double(settings, "motion_speed", 0.0);
+	obs_data_set_default_double(settings, "motion_angle", include_canvas ? 315.0 : 0.0);
+	obs_data_set_default_double(settings, "motion_speed", include_canvas ? 12.0 : 0.0);
 	obs_data_set_default_bool(settings, "alternating_lines", false);
 	obs_data_set_default_bool(settings, "speed_drift", false);
 	obs_data_set_default_double(settings, "speed_drift_amount", 0.25);
 	obs_data_set_default_bool(settings, "location_drift", false);
 	obs_data_set_default_double(settings, "location_drift_amount", 0.15);
 
-	obs_data_set_default_bool(settings, "twinkle_enabled", false);
-	obs_data_set_default_double(settings, "twinkle_amount", 0.5);
-	obs_data_set_default_double(settings, "twinkle_speed", 1.0);
+	obs_data_set_default_bool(settings, "twinkle_enabled", include_canvas);
+	obs_data_set_default_double(settings, "twinkle_amount", include_canvas ? 0.3 : 0.5);
+	obs_data_set_default_double(settings, "twinkle_speed", include_canvas ? 0.5 : 1.0);
 
 	obs_data_set_default_bool(settings, "autorot_enabled", false);
 	obs_data_set_default_double(settings, "autorot_speed", 45.0);
@@ -273,8 +361,26 @@ static void apply_item_kind_visibility(obs_properties_t *props, obs_data_t *sett
 	VIS("polygon_sides", kind == CITEM_SHAPE && shape_v == CSHAPE_POLYGON);
 	VIS("stroke_thickness", kind == CITEM_SHAPE && (shape_v == CSHAPE_CROSS || outline));
 	VIS("color", kind == CITEM_SHAPE);
-	VIS("image_path", kind == CITEM_IMAGE);
+	snprintf(key, sizeof(key), "item_%d_image_preset", i + 1);
+	bool custom_file = !*obs_data_get_string(settings, key);
+	VIS("image_preset", kind == CITEM_IMAGE);
+	VIS("image_path", kind == CITEM_IMAGE && custom_file);
 	VIS("source_name", kind == CITEM_SOURCE);
+	bool textured = kind == CITEM_IMAGE || kind == CITEM_SOURCE;
+	snprintf(key, sizeof(key), "item_%d_image_color_mode", i + 1);
+	bool tinted = (int)obs_data_get_int(settings, key) != CIMGCOLOR_ORIGINAL;
+	VIS("image_color_mode", textured);
+	VIS("image_tint", textured && tinted);
+	VIS("image_opacity", textured);
+	VIS("keep_aspect", textured);
+	/* Random colors replace the shape color or the image tint, so they
+	 * mean nothing for an image shown in its original colors. */
+	bool colorable = kind == CITEM_SHAPE || (textured && tinted);
+	snprintf(key, sizeof(key), "item_%d_random_colors", i + 1);
+	bool random = obs_data_get_bool(settings, key);
+	VIS("random_colors", colorable);
+	VIS("color_b", colorable && random);
+	VIS("color_c", colorable && random);
 #undef VIS
 }
 
@@ -336,10 +442,11 @@ static void apply_item_enabled_visibility(obs_properties_t *props, obs_data_t *s
 	char key[64];
 	snprintf(key, sizeof(key), "item_%d_enabled", i + 1);
 	bool en = obs_data_get_bool(settings, key);
-	const char *names[] = {"kind",        "shape",      "outline_only", "polygon_sides", "stroke_thickness",
-			       "color",       "image_path", "source_name",  "size",          "rotation",
-			       "offset_x",    "offset_y",   "density",      "twinkle_mode",  "speed_drift_mode",
-			       "autorot_mode"};
+	const char *names[] = {"kind",       "shape",         "outline_only",     "polygon_sides", "stroke_thickness",
+			       "color",      "image_preset",  "image_path",       "source_name",   "image_color_mode",
+			       "image_tint", "image_opacity", "keep_aspect",      "random_colors", "color_b",
+			       "color_c",    "size",          "rotation",         "offset_x",      "offset_y",
+			       "density",    "twinkle_mode",  "speed_drift_mode", "autorot_mode"};
 	for (size_t k = 0; k < sizeof(names) / sizeof(names[0]); ++k) {
 		snprintf(key, sizeof(key), "item_%d_%s", i + 1, names[k]);
 		obs_property_t *pp = obs_properties_get(props, key);
@@ -430,6 +537,35 @@ static void apply_vignette_visibility(obs_properties_t *props, obs_data_t *setti
 		if (pp)
 			obs_property_set_visible(pp, shape != CVIGN_CIRCLE);
 	}
+}
+
+static bool background_type_modified(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
+{
+	UNUSED_PARAMETER(p);
+	int type = (int)obs_data_get_int(settings, "background_type");
+	obs_property_t *pp = obs_properties_get(props, "background_color2");
+	if (pp)
+		obs_property_set_visible(pp, type != CBG_SOLID);
+	pp = obs_properties_get(props, "background_angle");
+	if (pp)
+		obs_property_set_visible(pp, type == CBG_LINEAR);
+	return true;
+}
+
+static void add_background_props(obs_properties_t *grp)
+{
+	obs_property_t *bt = obs_properties_add_list(grp, "background_type",
+						     obs_module_text("Constellations.Background.Type"),
+						     OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(bt, obs_module_text("Constellations.Background.Type.Solid"), CBG_SOLID);
+	obs_property_list_add_int(bt, obs_module_text("Constellations.Background.Type.Radial"), CBG_RADIAL);
+	obs_property_list_add_int(bt, obs_module_text("Constellations.Background.Type.Linear"), CBG_LINEAR);
+	obs_property_set_modified_callback(bt, background_type_modified);
+	obs_properties_add_color_alpha(grp, "background_color",
+				       obs_module_text("Constellations.Canvas.BackgroundColor"));
+	obs_properties_add_color_alpha(grp, "background_color2", obs_module_text("Constellations.Background.Color2"));
+	obs_properties_add_float_slider(grp, "background_angle", obs_module_text("Constellations.Background.Angle"),
+					0.0, 360.0, 1.0);
 }
 
 static bool item_count_modified(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
@@ -599,14 +735,47 @@ static void add_item_group(obs_properties_t *root, struct cpat_renderer *r, int 
 	snprintf(key, sizeof(key), "item_%d_color", i + 1);
 	obs_properties_add_color_alpha(grp, key, obs_module_text("Constellations.Shape.Color"));
 
+	snprintf(key, sizeof(key), "item_%d_image_preset", i + 1);
+	obs_property_t *ipr = obs_properties_add_list(grp, key, obs_module_text("Constellations.Item.ImagePreset"),
+						      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(ipr, obs_module_text("Constellations.Item.ImagePreset.Custom"), "");
+	for (size_t k = 0; k < sizeof(cpat_image_presets) / sizeof(cpat_image_presets[0]); ++k)
+		obs_property_list_add_string(ipr, obs_module_text(cpat_image_presets[k][1]), cpat_image_presets[k][0]);
+	obs_property_set_modified_callback(ipr, item_kind_modified);
+
 	snprintf(key, sizeof(key), "item_%d_image_path", i + 1);
 	obs_properties_add_path(grp, key, obs_module_text("Constellations.Item.ImagePath"), OBS_PATH_FILE,
-				"Images (*.png *.jpg *.jpeg *.bmp *.tga *.gif);;All Files (*.*)", NULL);
+				"Images (*.png *.jpg *.jpeg *.bmp *.tga *.gif *.svg);;SVG (*.svg);;All Files (*.*)",
+				NULL);
 
 	snprintf(key, sizeof(key), "item_%d_source_name", i + 1);
 	obs_property_t *src = obs_properties_add_list(grp, key, obs_module_text("Constellations.Item.Source"),
 						      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	fill_source_dropdown(src, r ? r->owner : NULL);
+
+	snprintf(key, sizeof(key), "item_%d_image_color_mode", i + 1);
+	obs_property_t *icm = obs_properties_add_list(grp, key, obs_module_text("Constellations.Item.ImageColor"),
+						      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(icm, obs_module_text("Constellations.Item.ImageColor.Original"), CIMGCOLOR_ORIGINAL);
+	obs_property_list_add_int(icm, obs_module_text("Constellations.Item.ImageColor.Tint"), CIMGCOLOR_TINT);
+	obs_property_list_add_int(icm, obs_module_text("Constellations.Item.ImageColor.Recolor"), CIMGCOLOR_RECOLOR);
+	obs_property_set_long_description(icm, obs_module_text("Constellations.Item.ImageColor.Tooltip"));
+	obs_property_set_modified_callback(icm, item_kind_modified);
+	snprintf(key, sizeof(key), "item_%d_image_tint", i + 1);
+	obs_properties_add_color(grp, key, obs_module_text("Constellations.Item.ImageTint"));
+	snprintf(key, sizeof(key), "item_%d_image_opacity", i + 1);
+	obs_properties_add_float_slider(grp, key, obs_module_text("Constellations.Item.ImageOpacity"), 0.0, 100.0, 1.0);
+	snprintf(key, sizeof(key), "item_%d_keep_aspect", i + 1);
+	obs_properties_add_bool(grp, key, obs_module_text("Constellations.Item.KeepAspect"));
+
+	snprintf(key, sizeof(key), "item_%d_random_colors", i + 1);
+	obs_property_t *rc = obs_properties_add_bool(grp, key, obs_module_text("Constellations.Item.RandomColors"));
+	obs_property_set_long_description(rc, obs_module_text("Constellations.Item.RandomColors.Tooltip"));
+	obs_property_set_modified_callback(rc, item_kind_modified);
+	snprintf(key, sizeof(key), "item_%d_color_b", i + 1);
+	obs_properties_add_color(grp, key, obs_module_text("Constellations.Item.ColorB"));
+	snprintf(key, sizeof(key), "item_%d_color_c", i + 1);
+	obs_properties_add_color(grp, key, obs_module_text("Constellations.Item.ColorC"));
 
 	snprintf(key, sizeof(key), "item_%d_size", i + 1);
 	obs_properties_add_float_slider(grp, key, obs_module_text("Constellations.Item.Size"), 1.0, 1024.0, 1.0);
@@ -672,8 +841,7 @@ void cpat_renderer_get_properties(struct cpat_renderer *r, obs_properties_t *pro
 		obs_properties_t *canvas = obs_properties_create();
 		obs_properties_add_int(canvas, "width", obs_module_text("Constellations.Canvas.Width"), 1, 8192, 1);
 		obs_properties_add_int(canvas, "height", obs_module_text("Constellations.Canvas.Height"), 1, 8192, 1);
-		obs_properties_add_color_alpha(canvas, "background_color",
-					       obs_module_text("Constellations.Canvas.BackgroundColor"));
+		add_background_props(canvas);
 		obs_properties_add_float_slider(canvas, "anchor_x_pct", obs_module_text("Constellations.Anchor.X"), 0.0,
 						100.0, 0.5);
 		obs_properties_add_float_slider(canvas, "anchor_y_pct", obs_module_text("Constellations.Anchor.Y"), 0.0,
@@ -683,8 +851,7 @@ void cpat_renderer_get_properties(struct cpat_renderer *r, obs_properties_t *pro
 		obs_properties_add_group(props, "canvas_group", obs_module_text("Constellations.Group.Canvas"),
 					 OBS_GROUP_NORMAL, canvas);
 	} else {
-		obs_properties_add_color_alpha(props, "background_color",
-					       obs_module_text("Constellations.Canvas.BackgroundColor"));
+		add_background_props(props);
 		obs_properties_add_float_slider(props, "anchor_x_pct", obs_module_text("Constellations.Anchor.X"), 0.0,
 						100.0, 0.5);
 		obs_properties_add_float_slider(props, "anchor_y_pct", obs_module_text("Constellations.Anchor.Y"), 0.0,
@@ -803,7 +970,16 @@ static void cpat_item_update(struct cpat_item *it, obs_data_t *settings, int ind
 	uint32_t c = (uint32_t)obs_data_get_int(settings, IK("color"));
 	vec4_from_rgba(&it->color, c);
 
-	const char *ip = obs_data_get_string(settings, IK("image_path"));
+	/* A built-in preset overrides the custom file; image_path holds
+	 * whichever path is actually loaded. */
+	const char *preset = obs_data_get_string(settings, IK("image_preset"));
+	char *preset_path = NULL;
+	if (*preset) {
+		char rel[64];
+		snprintf(rel, sizeof(rel), "images/%s.svg", preset);
+		preset_path = obs_module_file(rel);
+	}
+	const char *ip = preset_path ? preset_path : obs_data_get_string(settings, IK("image_path"));
 	bool image_changed = !it->image_path || strcmp(ip, it->image_path) != 0;
 	if (image_changed) {
 		bfree(it->image_path);
@@ -815,6 +991,7 @@ static void cpat_item_update(struct cpat_item *it, obs_data_t *settings, int ind
 	} else if (it->kind != CITEM_IMAGE && it->image_loaded) {
 		cpat_item_release_image(it);
 	}
+	bfree(preset_path);
 
 	const char *sn = obs_data_get_string(settings, IK("source_name"));
 	bool source_changed = !it->source_name || strcmp(sn, it->source_name) != 0;
@@ -831,9 +1008,18 @@ static void cpat_item_update(struct cpat_item *it, obs_data_t *settings, int ind
 		cpat_item_release_source(it);
 	}
 
+	it->image_color_mode = (int)obs_data_get_int(settings, IK("image_color_mode"));
+	vec4_from_rgba(&it->image_tint, (uint32_t)obs_data_get_int(settings, IK("image_tint")));
+	it->image_opacity = (float)obs_data_get_double(settings, IK("image_opacity")) / 100.0f;
+	it->keep_aspect = obs_data_get_bool(settings, IK("keep_aspect"));
+	it->random_colors = obs_data_get_bool(settings, IK("random_colors"));
+	vec4_from_rgba(&it->color_b, (uint32_t)obs_data_get_int(settings, IK("color_b")));
+	vec4_from_rgba(&it->color_c, (uint32_t)obs_data_get_int(settings, IK("color_c")));
+
 	it->size = (float)obs_data_get_double(settings, IK("size"));
 	if (it->size < 1.0f)
 		it->size = 1.0f;
+	cpat_item_refresh_svg(it);
 	it->rotation_deg = (float)obs_data_get_double(settings, IK("rotation"));
 	it->offset_x = (float)obs_data_get_double(settings, IK("offset_x"));
 	it->offset_y = (float)obs_data_get_double(settings, IK("offset_y"));
@@ -862,9 +1048,12 @@ void cpat_renderer_update(struct cpat_renderer *r, obs_data_t *settings, bool in
 		if (r->height == 0)
 			r->height = 1080;
 	}
-	uint32_t bg = (uint32_t)obs_data_get_int(settings, "background_color");
-	vec4_from_rgba(&r->background_color, bg);
-	r->has_background = (r->background_color.w > 0.0001f);
+	r->background_type = (int)obs_data_get_int(settings, "background_type");
+	vec4_from_rgba(&r->background_color, (uint32_t)obs_data_get_int(settings, "background_color"));
+	vec4_from_rgba(&r->background_color2, (uint32_t)obs_data_get_int(settings, "background_color2"));
+	r->background_angle_deg = (float)obs_data_get_double(settings, "background_angle");
+	r->has_background = r->background_color.w > 0.0001f ||
+			    (r->background_type != CBG_SOLID && r->background_color2.w > 0.0001f);
 	r->anchor_x_pct = (float)obs_data_get_double(settings, "anchor_x_pct");
 	r->anchor_y_pct = (float)obs_data_get_double(settings, "anchor_y_pct");
 	r->canvas_rotation_deg = (float)obs_data_get_double(settings, "canvas_rotation");
@@ -948,20 +1137,32 @@ void cpat_renderer_tick(struct cpat_renderer *r, float seconds)
 
 void cpat_renderer_render_background(struct cpat_renderer *r, uint32_t w, uint32_t h)
 {
-	if (!r->has_background || w == 0 || h == 0)
+	if (!r->has_background || !r->effect || w == 0 || h == 0)
 		return;
-	gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
-	gs_eparam_t *color = gs_effect_get_param_by_name(solid, "color");
-	gs_effect_set_vec4(color, &r->background_color);
+	struct vec2 canvas = {(float)w, (float)h};
+	float ang = r->background_angle_deg * (float)(M_PI / 180.0);
+	struct vec2 dir = {cosf(ang), sinf(ang)};
+	gs_eparam_t *p;
+	p = gs_effect_get_param_by_name(r->effect, "canvas_size");
+	if (p)
+		gs_effect_set_vec2(p, &canvas);
+	p = gs_effect_get_param_by_name(r->effect, "bg_color");
+	if (p)
+		gs_effect_set_vec4(p, &r->background_color);
+	p = gs_effect_get_param_by_name(r->effect, "bg_color2");
+	if (p)
+		gs_effect_set_vec4(p, &r->background_color2);
+	p = gs_effect_get_param_by_name(r->effect, "bg_type");
+	if (p)
+		gs_effect_set_float(p, (float)r->background_type);
+	p = gs_effect_get_param_by_name(r->effect, "bg_dir");
+	if (p)
+		gs_effect_set_vec2(p, &dir);
 
 	gs_blend_state_push();
 	gs_blend_function(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA);
-	gs_technique_t *tech = gs_effect_get_technique(solid, "Solid");
-	gs_technique_begin(tech);
-	gs_technique_begin_pass(tech, 0);
-	gs_draw_sprite(NULL, 0, w, h);
-	gs_technique_end_pass(tech);
-	gs_technique_end(tech);
+	while (gs_effect_loop(r->effect, "DrawBackground"))
+		gs_draw_sprite(NULL, 0, w, h);
 	gs_blend_state_pop();
 }
 
@@ -1031,9 +1232,29 @@ static void set_common_uniforms(struct cpat_renderer *r, struct cpat_item *it, u
 	p = gs_effect_get_param_by_name(r->effect, "item_offset");
 	if (p)
 		gs_effect_set_vec2(p, &ioff);
+	/* Shapes use their own color. Images and sources pass the tint color
+	 * with the opacity slider as alpha; the shader decides how the tint
+	 * applies from image_color_mode. */
+	struct vec4 color = it->color;
+	if (it->kind != CITEM_SHAPE) {
+		color = it->image_tint;
+		color.w = it->image_opacity;
+	}
 	p = gs_effect_get_param_by_name(r->effect, "shape_color");
 	if (p)
-		gs_effect_set_vec4(p, &it->color);
+		gs_effect_set_vec4(p, &color);
+	p = gs_effect_get_param_by_name(r->effect, "image_color_mode");
+	if (p)
+		gs_effect_set_float(p, (float)it->image_color_mode);
+	p = gs_effect_get_param_by_name(r->effect, "color_variation");
+	if (p)
+		gs_effect_set_float(p, it->random_colors ? 1.0f : 0.0f);
+	p = gs_effect_get_param_by_name(r->effect, "color_b");
+	if (p)
+		gs_effect_set_vec4(p, &it->color_b);
+	p = gs_effect_get_param_by_name(r->effect, "color_c");
+	if (p)
+		gs_effect_set_vec4(p, &it->color_c);
 	p = gs_effect_get_param_by_name(r->effect, "shape_kind");
 	if (p)
 		gs_effect_set_int(p, it->shape);
@@ -1221,9 +1442,9 @@ void cpat_renderer_render_items(struct cpat_renderer *r, uint32_t w, uint32_t h)
 		gs_texture_t *tex = NULL;
 		const char *technique = "DrawShape";
 		if (it->kind == CITEM_IMAGE) {
-			if (!it->image_loaded || !it->image.texture)
+			tex = cpat_item_image_texture(it);
+			if (!tex)
 				continue;
-			tex = it->image.texture;
 			technique = "DrawImage";
 		} else if (it->kind == CITEM_SOURCE) {
 			if (!it->source_texrender)
@@ -1240,6 +1461,14 @@ void cpat_renderer_render_items(struct cpat_renderer *r, uint32_t w, uint32_t h)
 			gs_eparam_t *tp = gs_effect_get_param_by_name(r->effect, "cell_texture");
 			if (tp)
 				gs_effect_set_texture(tp, tex);
+			float aspect = 1.0f;
+			uint32_t tw = gs_texture_get_width(tex);
+			uint32_t th = gs_texture_get_height(tex);
+			if (it->keep_aspect && tw && th)
+				aspect = (float)tw / (float)th;
+			tp = gs_effect_get_param_by_name(r->effect, "tex_aspect");
+			if (tp)
+				gs_effect_set_float(tp, aspect);
 		}
 
 		while (gs_effect_loop(r->effect, technique))

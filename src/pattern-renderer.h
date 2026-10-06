@@ -26,6 +26,22 @@ struct cpat_item {
 	char *image_path;
 	gs_image_file_t image;
 	bool image_loaded;
+	int image_color_mode;
+	struct vec4 image_tint;
+	float image_opacity;
+	bool keep_aspect;
+
+	/* Random Color Per Cell: each cell picks its color from the item's
+	 * main color (shape color or image tint) and these two extras. */
+	bool random_colors;
+	struct vec4 color_b;
+	struct vec4 color_c;
+
+	/* SVG images are kept as vector data and rasterized at the item's
+	 * size, so they stay sharp however large the item is drawn. */
+	struct NSVGimage *svg;
+	gs_texture_t *svg_texture;
+	uint32_t svg_px;
 
 	char *source_name;
 	obs_weak_source_t *source_ref;
@@ -56,7 +72,10 @@ struct cpat_renderer {
 
 	uint32_t width, height;
 	bool has_background;
+	int background_type;
 	struct vec4 background_color;
+	struct vec4 background_color2;
+	float background_angle_deg;
 	float anchor_x_pct;
 	float anchor_y_pct;
 	float canvas_rotation_deg;
