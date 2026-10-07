@@ -56,7 +56,25 @@ uniform int vignette_polygon_sides;
 uniform float vignette_softness;
 uniform float vignette_inverted;
 
+// Pattern Border. The frame spans the whole canvas; its band runs from the
+// outer edge to an inner edge inset by border_widths.
+uniform float border_active;      // 1 = mask everything to the frame band
+uniform float border_clip;        // 1 = shapes clip to the band, 0 = only to the outer edge
+uniform float4 border_widths;     // left, top, right, bottom (px)
+uniform float border_radius;      // outer corner radius (px)
+uniform float4 border_inner_radii; // inner corner radii: tl, tr, br, bl (px)
+uniform float border_softness;    // inner edge fade (px)
+uniform float border_rows;        // perimeter layout: rows across the band
+uniform float border_stagger;     // 1 = odd rows shift by half a spacing
+uniform float border_align;       // 1 = shapes turn to follow their side
+uniform float border_march;       // distance (px) marched clockwise along the frame
+
+// Pattern Border "Round Source Corners": the source texture and its clip.
+uniform float2 src_size;
+uniform float4 src_radii;         // tl, tr, br, bl (px)
+
 uniform texture2d cell_texture;
+uniform texture2d image;
 
 sampler_state TileSampler {
 	Filter   = Linear;
@@ -362,6 +380,423 @@ float shape_sdf(float2 p)
 	return abs(p.x) - r;
 }
 
+// Rounded box with its own radius per corner (tl, tr, br, bl), y down.
+float sd_rbox(float2 p, float2 b, float4 r)
+{
+	float rr = r.z;
+	if (p.x < 0.0) {
+		if (p.y < 0.0)
+			rr = r.x;
+		else
+			rr = r.w;
+	} else if (p.y < 0.0) {
+		rr = r.y;
+	}
+	float2 q = abs(p) - b + rr;
+	return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - rr;
+}
+
+float border_outer_sd(float2 px)
+{
+	float2 half_c = canvas_size * 0.5;
+	float rc = border_radius;
+	return sd_rbox(px - half_c, half_c, float4(rc, rc, rc, rc));
+}
+
+float border_inner_sd(float2 px)
+{
+	float2 lo = border_widths.xy;
+	float2 hi = max(canvas_size - border_widths.zw, lo);
+	float2 b = (hi - lo) * 0.5;
+	float4 r = min(border_inner_radii, min(b.x, b.y));
+	return sd_rbox(px - (lo + hi) * 0.5, b, r);
+}
+
+// Coverage of the frame band: inside the outer edge and outside the inner
+// edge, fading in over border_softness px from the inner edge.
+float border_band_mask(float2 px)
+{
+	float outer = 1.0 - smoothstep(-0.5, 0.5, border_outer_sd(px));
+	float inner = smoothstep(-0.5, 0.5 + border_softness, border_inner_sd(px));
+	return outer * inner;
+}
+
+float border_shape_mask(float2 px)
+{
+	if (border_active < 0.5)
+		return 1.0;
+	if (border_clip > 0.5)
+		return border_band_mask(px);
+	return 1.0 - smoothstep(-0.5, 0.5, border_outer_sd(px));
+}
+
+// One row of the perimeter layout: a rounded rectangle path walked clockwise
+// from the top-left corner as eight segments (top side, top-right corner,
+// right side, bottom-right corner, bottom side, bottom-left corner, left
+// side, top-left corner). Each segment holds a whole number of shapes, so
+// shapes sit evenly on every side and a shape lands on each sharp corner.
+// The path parameter u counts shapes: segment k spans u0_k .. u0_k + n_k.
+struct BorderRow {
+	float4 box;  // x0, y0, x1, y1
+	float4 rad;  // corner radii tl, tr, br, bl
+	float4 ns;   // shapes on the top, right, bottom, left sides
+	float4 na;   // shapes on the tr, br, bl, tl corners
+	float total; // shapes in the whole row
+};
+
+// Row at fraction f (0 = outer edge, 1 = inner edge) across the band, with
+// shapes spaced about cs px apart.
+BorderRow border_make_row(float f, float cs)
+{
+	BorderRow br;
+	float x0 = f * border_widths.x;
+	float y0 = f * border_widths.y;
+	float x1 = canvas_size.x - f * border_widths.z;
+	float y1 = canvas_size.y - f * border_widths.w;
+	if (x1 < x0) {
+		x0 = (x0 + x1) * 0.5;
+		x1 = x0;
+	}
+	if (y1 < y0) {
+		y0 = (y0 + y1) * 0.5;
+		y1 = y0;
+	}
+	float lim = min(x1 - x0, y1 - y0) * 0.5;
+	float rc = border_radius;
+	br.box = float4(x0, y0, x1, y1);
+	br.rad = min(lerp(float4(rc, rc, rc, rc), border_inner_radii, f), lim);
+	float4 ls = max(float4(x1 - x0 - br.rad.x - br.rad.y, y1 - y0 - br.rad.y - br.rad.z,
+			       x1 - x0 - br.rad.z - br.rad.w, y1 - y0 - br.rad.w - br.rad.x), 0.0);
+	float4 la = float4(br.rad.y, br.rad.z, br.rad.w, br.rad.x) * 1.5707963;
+	br.ns = max(floor(ls / cs + 0.5), 1.0) * step(0.5, ls);
+	br.na = floor(la / cs + 0.5);
+	br.total = dot(br.ns, float4(1.0, 1.0, 1.0, 1.0)) + dot(br.na, float4(1.0, 1.0, 1.0, 1.0));
+	return br;
+}
+
+float border_wrap(float u, float n)
+{
+	return u - floor(u / n) * n;
+}
+
+// Heading along a side at v shapes into it. Next to a sharp corner the
+// heading turns over the half spacing on either side of it, so the corner
+// shape points diagonally and moving shapes swing around the corner.
+float border_side_angle(float base, float v, float n, float r_prev, float r_next)
+{
+	float a = base;
+	if (r_prev < 0.5 && v < 0.5)
+		a -= (0.5 - v) * 1.5707963;
+	if (r_next < 0.5 && v > n - 0.5)
+		a += (v - n + 0.5) * 1.5707963;
+	return a;
+}
+
+// Point at path parameter u (0 <= u < total), and its clockwise heading.
+float2 border_row_point(BorderRow br, float u, out float ang)
+{
+	float x0 = br.box.x;
+	float y0 = br.box.y;
+	float x1 = br.box.z;
+	float y1 = br.box.w;
+	float4 r = br.rad;
+	float u0 = 0.0;
+	ang = 0.0;
+
+	if (u < u0 + br.ns.x) {
+		float v = u - u0;
+		ang = border_side_angle(0.0, v, br.ns.x, r.x, r.y);
+		return lerp(float2(x0 + r.x, y0), float2(x1 - r.y, y0), v / br.ns.x);
+	}
+	u0 += br.ns.x;
+	if (u < u0 + br.na.x) {
+		float a = -1.5707963 + (u - u0) / br.na.x * 1.5707963;
+		ang = a + 1.5707963;
+		return float2(x1 - r.y, y0 + r.y) + r.y * float2(cos(a), sin(a));
+	}
+	u0 += br.na.x;
+	if (u < u0 + br.ns.y) {
+		float v = u - u0;
+		ang = border_side_angle(1.5707963, v, br.ns.y, r.y, r.z);
+		return lerp(float2(x1, y0 + r.y), float2(x1, y1 - r.z), v / br.ns.y);
+	}
+	u0 += br.ns.y;
+	if (u < u0 + br.na.y) {
+		float a = (u - u0) / br.na.y * 1.5707963;
+		ang = a + 1.5707963;
+		return float2(x1 - r.z, y1 - r.z) + r.z * float2(cos(a), sin(a));
+	}
+	u0 += br.na.y;
+	if (u < u0 + br.ns.z) {
+		float v = u - u0;
+		ang = border_side_angle(3.1415927, v, br.ns.z, r.z, r.w);
+		return lerp(float2(x1 - r.z, y1), float2(x0 + r.w, y1), v / br.ns.z);
+	}
+	u0 += br.ns.z;
+	if (u < u0 + br.na.z) {
+		float a = 1.5707963 + (u - u0) / br.na.z * 1.5707963;
+		ang = a + 1.5707963;
+		return float2(x0 + r.w, y1 - r.w) + r.w * float2(cos(a), sin(a));
+	}
+	u0 += br.na.z;
+	if (u < u0 + br.ns.w) {
+		float v = u - u0;
+		ang = border_side_angle(4.7123890, v, br.ns.w, r.w, r.x);
+		return lerp(float2(x0, y1 - r.w), float2(x0, y0 + r.x), v / br.ns.w);
+	}
+	u0 += br.ns.w;
+	float a = 3.1415927 + (u - u0) / max(br.na.w, 1.0) * 1.5707963;
+	ang = a + 1.5707963;
+	return float2(x0 + r.x, y0 + r.x) + r.x * float2(cos(a), sin(a));
+}
+
+void border_project_line(float2 px, float2 a, float2 b, float u0, float n, inout float best_d, inout float best_u)
+{
+	float2 d = b - a;
+	float l2 = dot(d, d);
+	float t = 0.0;
+	if (l2 > 1.0e-6)
+		t = saturate(dot(px - a, d) / l2);
+	float dist = length(px - (a + d * t));
+	if (dist < best_d) {
+		best_d = dist;
+		best_u = u0 + t * n;
+	}
+}
+
+void border_project_arc(float2 px, float2 c, float r, float a_start, float u0, float n, inout float best_d,
+			inout float best_u)
+{
+	float2 q = px - c;
+	float t = 0.5;
+	if (r > 0.01) {
+		float2 rq = rotate2(q, -(a_start + 0.78539816));
+		t = clamp(atan2(rq.y, rq.x), -0.78539816, 0.78539816) / 1.5707963 + 0.5;
+	}
+	float a = a_start + t * 1.5707963;
+	float dist = length(q - r * float2(cos(a), sin(a)));
+	if (dist < best_d) {
+		best_d = dist;
+		best_u = u0 + t * n;
+	}
+}
+
+// Path parameter of the point on the row nearest to px, and its distance.
+float border_row_project(BorderRow br, float2 px, out float dist)
+{
+	float x0 = br.box.x;
+	float y0 = br.box.y;
+	float x1 = br.box.z;
+	float y1 = br.box.w;
+	float4 r = br.rad;
+	float best_d = 1.0e9;
+	float best_u = 0.0;
+	float u0 = 0.0;
+	border_project_line(px, float2(x0 + r.x, y0), float2(x1 - r.y, y0), u0, br.ns.x, best_d, best_u);
+	u0 += br.ns.x;
+	border_project_arc(px, float2(x1 - r.y, y0 + r.y), r.y, -1.5707963, u0, br.na.x, best_d, best_u);
+	u0 += br.na.x;
+	border_project_line(px, float2(x1, y0 + r.y), float2(x1, y1 - r.z), u0, br.ns.y, best_d, best_u);
+	u0 += br.ns.y;
+	border_project_arc(px, float2(x1 - r.z, y1 - r.z), r.z, 0.0, u0, br.na.y, best_d, best_u);
+	u0 += br.na.y;
+	border_project_line(px, float2(x1 - r.z, y1), float2(x0 + r.w, y1), u0, br.ns.z, best_d, best_u);
+	u0 += br.ns.z;
+	border_project_arc(px, float2(x0 + r.w, y1 - r.w), r.w, 1.5707963, u0, br.na.z, best_d, best_u);
+	u0 += br.na.z;
+	border_project_line(px, float2(x0, y1 - r.w), float2(x0, y0 + r.x), u0, br.ns.w, best_d, best_u);
+	u0 += br.ns.w;
+	border_project_arc(px, float2(x0 + r.x, y0 + r.x), r.x, 3.1415927, u0, br.na.w, best_d, best_u);
+	dist = best_d;
+	return best_u;
+}
+
+// Shapes marched along a row so far, in shape spacings. Alternating Line
+// Motion reverses odd rows and Speed Drift varies the pace per row, as they
+// do for lattice rows; staggered rows sit half a spacing along.
+float border_row_phase(float row, float cs)
+{
+	float m = border_march;
+	if (alt_lines > 0.5 && frac(row * 0.5) > 0.25)
+		m = -m;
+	if (drift_speed_amt > 0.0) {
+		float s = (hash11(float2(row, 7.0), drift_speed_seed) - 0.5) * 2.0 * drift_speed_amt;
+		m *= (1.0 + s);
+	}
+	float ph = (m + item_offset.x) / cs;
+	if (border_stagger > 0.5 && frac(row * 0.5) > 0.25)
+		ph += 0.5;
+	return ph;
+}
+
+// Fragment position in the frame of the shape centered at pos with heading
+// ang: item_offset.y moves the shape toward the inside of the frame, and
+// with Align to Edge the shape turns so its top faces outward.
+float2 border_local(float2 frag_px, float2 pos, float ang, float2 cid, float cs)
+{
+	float2 tng = float2(cos(ang), sin(ang));
+	float2 c = pos + float2(-tng.y, tng.x) * item_offset.y;
+	if (drift_loc_amt > 0.0) {
+		// Same two-circle wander as the lattice (see cell_local_at).
+		float2 ph = hash22(cid + 0.5, item_seed) * 6.2831853;
+		float2 rate = hash22(cid + 17.9, item_seed + 4.7) + 0.5;
+		float amp = drift_loc_amt * cs * 0.5;
+		float a1 = elapsed_time * rate.x + ph.x;
+		float a2 = ph.y - elapsed_time * rate.y;
+		c += float2(cos(a1) + cos(a2), sin(a1) + sin(a2)) * amp;
+	}
+	float2 v = frag_px - c;
+	if (border_align > 0.5)
+		v = rotate2(v, -ang);
+	return v;
+}
+
+// How far (px) a shape reaches from its center, and how many neighbors on
+// each side along a row can reach a fragment.
+float border_extent()
+{
+	float cs = max(cell_size, 1.0);
+	float extent = shape_size * 0.71;
+	if (outline_only > 0.5)
+		extent += stroke_thickness * shape_size * 0.5;
+	return extent + drift_loc_amt * cs + abs(item_offset.y);
+}
+
+int border_reach(float extent)
+{
+	// Rounding each segment to whole shapes can tighten the spacing to
+	// two thirds of the cell size.
+	float cs = max(cell_size, 1.0);
+	return int(clamp(ceil(extent / (cs * 0.66)) + 1.0, 1.0, 8.0));
+}
+
+float4 PSBorderShape(VertData v_in) : TARGET
+{
+	float2 frag_px = v_in.uv * canvas_size;
+	float mask = border_shape_mask(frag_px);
+	if (mask <= 0.0)
+		return float4(0.0, 0.0, 0.0, 0.0);
+	float cs = max(cell_size, 1.0);
+	float extent = border_extent();
+	int reach = border_reach(extent);
+	int rows = int(clamp(border_rows, 1.0, 8.0));
+	float stroke_w = max(stroke_thickness, 0.001) * shape_size;
+	float alpha = 0.0;
+	float best_a = -1.0;
+	float2 color_cid = float2(0.0, 0.0);
+	for (int j = 0; j < rows; ++j) {
+		BorderRow br = border_make_row((float(j) + 0.5) / float(rows), cs);
+		if (br.total < 0.5)
+			continue;
+		float pd;
+		float pu = border_row_project(br, frag_px, pd);
+		if (pd > extent + 2.0)
+			continue;
+		float phase = border_row_phase(float(j), cs);
+		float base = floor(pu - phase + 0.5);
+		for (int d = -reach; d <= reach; ++d) {
+			float k = base + float(d);
+			float2 cid = float2(border_wrap(k, br.total), float(j));
+			if (!cell_belongs_to_this_item(cid))
+				continue;
+			float ang;
+			float2 pos = border_row_point(br, border_wrap(k + phase, br.total), ang);
+			float2 p = border_local(frag_px, pos, ang, cid, cs);
+			p = rotate2(p, shape_rotation + auto_rot_angle(cid));
+			float sd = shape_sdf(p);
+			if (outline_only > 0.5)
+				sd = abs(sd) - stroke_w * 0.5;
+			float a = 1.0 - smoothstep(-0.75, 0.75, sd);
+			float ta = a;
+			if (twinkle_amount > 0.001)
+				ta *= twinkle_alpha_calc(cid);
+			// Color follows the instance with the most raw coverage
+			// so a faded-out neighbor never steals it.
+			if (a > best_a) {
+				best_a = a;
+				color_cid = cid;
+			}
+			alpha = max(alpha, ta);
+		}
+	}
+	return float4(cell_rgb(color_cid), shape_color.a * alpha * mask);
+}
+
+float4 PSBorderImage(VertData v_in) : TARGET
+{
+	float2 frag_px = v_in.uv * canvas_size;
+	float mask = border_shape_mask(frag_px);
+	if (mask <= 0.0)
+		return float4(0.0, 0.0, 0.0, 0.0);
+	float cs = max(cell_size, 1.0);
+	float extent = border_extent();
+	int reach = border_reach(extent);
+	int rows = int(clamp(border_rows, 1.0, 8.0));
+	float2 half_ext = float2(shape_size, shape_size) * 0.5;
+	if (tex_aspect >= 1.0)
+		half_ext.y /= tex_aspect;
+	else
+		half_ext.x *= tex_aspect;
+
+	float best_dist2 = 1.0e12;
+	float2 best_p = float2(0.0, 0.0);
+	float2 best_cid = float2(0.0, 0.0);
+	float found = 0.0;
+	for (int j = 0; j < rows; ++j) {
+		BorderRow br = border_make_row((float(j) + 0.5) / float(rows), cs);
+		if (br.total < 0.5)
+			continue;
+		float pd;
+		float pu = border_row_project(br, frag_px, pd);
+		if (pd > extent + 2.0)
+			continue;
+		float phase = border_row_phase(float(j), cs);
+		float base = floor(pu - phase + 0.5);
+		for (int d = -reach; d <= reach; ++d) {
+			float k = base + float(d);
+			float2 cid = float2(border_wrap(k, br.total), float(j));
+			if (!cell_belongs_to_this_item(cid))
+				continue;
+			float ang;
+			float2 pos = border_row_point(br, border_wrap(k + phase, br.total), ang);
+			float2 p = border_local(frag_px, pos, ang, cid, cs);
+			p = rotate2(p, shape_rotation + auto_rot_angle(cid));
+			if (abs(p.x) <= half_ext.x && abs(p.y) <= half_ext.y) {
+				float d2 = dot(p, p);
+				if (d2 < best_dist2) {
+					best_dist2 = d2;
+					best_p = p;
+					best_cid = cid;
+					found = 1.0;
+				}
+			}
+		}
+	}
+	if (found < 0.5)
+		return float4(0.0, 0.0, 0.0, 0.0);
+	float2 uv = best_p / (half_ext * 2.0) + 0.5;
+	float4 tex = cell_texture.Sample(TileSampler, uv);
+	float3 tint = cell_rgb(best_cid);
+	if (image_color_mode > 1.5)
+		tex.rgb = tint;
+	else if (image_color_mode > 0.5)
+		tex.rgb *= tint;
+	tex.a *= shape_color.a * mask;
+	if (twinkle_amount > 0.001)
+		tex.a *= twinkle_alpha_calc(best_cid);
+	return tex;
+}
+
+// Draws the filtered source clipped to a rounded box covering it.
+float4 PSSourceRounded(VertData v_in) : TARGET
+{
+	float4 c = image.Sample(TileSampler, v_in.uv);
+	float2 half_s = src_size * 0.5;
+	float4 r = min(src_radii, min(half_s.x, half_s.y));
+	float d = sd_rbox(v_in.uv * src_size - half_s, half_s, r);
+	return c * (1.0 - smoothstep(-0.5, 0.5, d));
+}
+
 float4 PSShape(VertData v_in) : TARGET
 {
 	float2 frag_px = v_in.uv * canvas_size;
@@ -429,7 +864,7 @@ float4 PSShape(VertData v_in) : TARGET
 		float edge = clamp(fwidth(best_d), 0.5, 2.0);
 		alpha = 1.0 - smoothstep(-edge, edge, best_d);
 	}
-	alpha *= vignette_mask_calc(frag_px);
+	alpha *= vignette_mask_calc(frag_px) * border_shape_mask(frag_px);
 	return float4(cell_rgb(color_cid), shape_color.a * alpha);
 }
 
@@ -478,7 +913,7 @@ float4 PSImage(VertData v_in) : TARGET
 		tex.rgb = tint;
 	else if (image_color_mode > 0.5)
 		tex.rgb *= tint;
-	tex.a *= shape_color.a * vignette_mask_calc(frag_px);
+	tex.a *= shape_color.a * vignette_mask_calc(frag_px) * border_shape_mask(frag_px);
 	if (twinkle_amount > 0.001)
 		tex.a *= twinkle_alpha_calc(best_cid);
 	return tex;
@@ -488,20 +923,24 @@ float4 PSBackground(VertData v_in) : TARGET
 {
 	float2 px = v_in.uv * canvas_size;
 	float2 half_canvas = canvas_size * 0.5;
-	if (bg_type < 0.5)
-		return bg_color;
-	float t;
-	if (bg_type < 1.5) {
-		// Radial: center of the canvas out to its corners.
-		t = length(px - half_canvas) / max(length(half_canvas), 1.0);
-	} else {
-		// Linear: spans the canvas exactly along bg_dir.
-		float extent = abs(bg_dir.x) * half_canvas.x + abs(bg_dir.y) * half_canvas.y;
-		t = dot(px - half_canvas, bg_dir) / max(2.0 * extent, 1.0) + 0.5;
+	float4 c = bg_color;
+	if (bg_type > 0.5) {
+		float t;
+		if (bg_type < 1.5) {
+			// Radial: center of the canvas out to its corners.
+			t = length(px - half_canvas) / max(length(half_canvas), 1.0);
+		} else {
+			// Linear: spans the canvas exactly along bg_dir.
+			float extent = abs(bg_dir.x) * half_canvas.x + abs(bg_dir.y) * half_canvas.y;
+			t = dot(px - half_canvas, bg_dir) / max(2.0 * extent, 1.0) + 0.5;
+		}
+		c = lerp(bg_color, bg_color2, saturate(t));
+		// Dark gradients band visibly in 8-bit output; one LSB of noise
+		// hides it.
+		c.rgb += (hash11(floor(px), 0.0) - 0.5) / 255.0;
 	}
-	float4 c = lerp(bg_color, bg_color2, saturate(t));
-	// Dark gradients band visibly in 8-bit output; one LSB of noise hides it.
-	c.rgb += (hash11(floor(px), 0.0) - 0.5) / 255.0;
+	if (border_active > 0.5)
+		c.a *= border_band_mask(px);
 	return c;
 }
 
@@ -529,5 +968,32 @@ technique DrawImage
 	{
 		vertex_shader = VSDefault(v_in);
 		pixel_shader  = PSImage(v_in);
+	}
+}
+
+technique DrawBorderShape
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSBorderShape(v_in);
+	}
+}
+
+technique DrawBorderImage
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSBorderImage(v_in);
+	}
+}
+
+technique DrawSourceRounded
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSSourceRounded(v_in);
 	}
 }

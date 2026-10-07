@@ -29,8 +29,8 @@ static void *cpat_filter_create(obs_data_t *settings, obs_source_t *source)
 {
 	struct cpat_filter *f = bzalloc(sizeof(*f));
 	f->self = source;
-	cpat_renderer_init(&f->r, source);
-	cpat_renderer_update(&f->r, settings, false);
+	cpat_renderer_init(&f->r, source, CPAT_HOST_FILTER);
+	cpat_renderer_update(&f->r, settings);
 	return f;
 }
 
@@ -44,7 +44,7 @@ static void cpat_filter_destroy(void *data)
 static void cpat_filter_update(void *data, obs_data_t *settings)
 {
 	struct cpat_filter *f = data;
-	cpat_renderer_update(&f->r, settings, false);
+	cpat_renderer_update(&f->r, settings);
 }
 
 static void cpat_filter_tick(void *data, float seconds)
@@ -78,13 +78,13 @@ static obs_properties_t *cpat_filter_props(void *data)
 {
 	struct cpat_filter *f = data;
 	obs_properties_t *props = obs_properties_create();
-	cpat_renderer_get_properties(&f->r, props, false);
+	cpat_renderer_get_properties(f ? &f->r : NULL, props, CPAT_HOST_FILTER);
 	return props;
 }
 
 static void cpat_filter_defaults(obs_data_t *settings)
 {
-	cpat_renderer_set_defaults(settings, false);
+	cpat_renderer_set_defaults(settings, CPAT_HOST_FILTER);
 }
 
 static struct obs_source_info cpat_filter_info = {

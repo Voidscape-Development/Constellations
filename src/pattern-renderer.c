@@ -156,10 +156,11 @@ static void cpat_item_clear(struct cpat_item *it)
 	memset(it, 0, sizeof(*it));
 }
 
-void cpat_renderer_init(struct cpat_renderer *r, obs_source_t *owner)
+void cpat_renderer_init(struct cpat_renderer *r, obs_source_t *owner, enum cpat_host host)
 {
 	memset(r, 0, sizeof(*r));
 	r->owner = owner;
+	r->host = host;
 
 	char *path = obs_module_file("effects/pattern.effect");
 	if (!path) {
@@ -189,13 +190,20 @@ void cpat_renderer_free(struct cpat_renderer *r)
 	}
 }
 
-void cpat_renderer_set_defaults(obs_data_t *settings, bool include_canvas)
+void cpat_renderer_set_defaults(obs_data_t *settings, enum cpat_host host)
 {
+	const bool include_canvas = host == CPAT_HOST_SOURCE;
+	const bool border = host == CPAT_HOST_BORDER;
 	if (include_canvas) {
 		obs_data_set_default_int(settings, "width", 1920);
 		obs_data_set_default_int(settings, "height", 1080);
 		/* Charcoal center fading to near-black corners. */
 		obs_data_set_default_int(settings, "background_type", CBG_RADIAL);
+		obs_data_set_default_int(settings, "background_color", CPAT_CHARCOAL);
+		obs_data_set_default_int(settings, "background_color2", CPAT_NEAR_BLACK);
+	} else if (border) {
+		/* A solid charcoal frame. */
+		obs_data_set_default_int(settings, "background_type", CBG_SOLID);
 		obs_data_set_default_int(settings, "background_color", CPAT_CHARCOAL);
 		obs_data_set_default_int(settings, "background_color2", CPAT_NEAR_BLACK);
 	} else {
@@ -212,9 +220,13 @@ void cpat_renderer_set_defaults(obs_data_t *settings, bool include_canvas)
 	obs_data_set_default_int(settings, "grid_order", CGRID_RANDOM);
 
 	/* The standalone source starts as slowly drifting, twinkling gold stars
-	 * on charcoal; the filter keeps plain white dots over the video. */
-	const int default_shape = include_canvas ? CSHAPE_STAR : CSHAPE_CIRCLE;
-	const long long default_color = include_canvas ? CPAT_GOLD : 0xFFFFFFFF;
+	 * on charcoal; the filter keeps plain white dots over the video; the
+	 * border is a still row of gold stars around a charcoal frame. */
+	const bool gold_stars = include_canvas || border;
+	const int default_shape = gold_stars ? CSHAPE_STAR : CSHAPE_CIRCLE;
+	const long long default_color = gold_stars ? CPAT_GOLD : 0xFFFFFFFF;
+	const double default_size = border ? 20.0 : 24.0;
+	const double default_density = border ? 3.0 : 2.0;
 
 	for (int i = 0; i < CONSTELLATIONS_MAX_ITEMS; ++i) {
 		char key[64];
@@ -236,11 +248,11 @@ void cpat_renderer_set_defaults(obs_data_t *settings, bool include_canvas)
 		obs_data_set_default_int(settings, DK("image_tint"), CPAT_GOLD);
 		obs_data_set_default_double(settings, DK("image_opacity"), 100.0);
 		obs_data_set_default_string(settings, DK("source_name"), "");
-		obs_data_set_default_double(settings, DK("size"), 24.0);
+		obs_data_set_default_double(settings, DK("size"), default_size);
 		obs_data_set_default_double(settings, DK("rotation"), 0.0);
 		obs_data_set_default_double(settings, DK("offset_x"), 0.0);
 		obs_data_set_default_double(settings, DK("offset_y"), 0.0);
-		obs_data_set_default_double(settings, DK("density"), 2.0);
+		obs_data_set_default_double(settings, DK("density"), default_density);
 		obs_data_set_default_int(settings, DK("twinkle_mode"), CTWINKLE_GLOBAL);
 		obs_data_set_default_double(settings, DK("twinkle_amount"), 0.5);
 		obs_data_set_default_double(settings, DK("twinkle_speed"), 1.0);
@@ -543,20 +555,25 @@ static bool background_type_modified(obs_properties_t *props, obs_property_t *p,
 {
 	UNUSED_PARAMETER(p);
 	int type = (int)obs_data_get_int(settings, "background_type");
-	obs_property_t *pp = obs_properties_get(props, "background_color2");
+	obs_property_t *pp = obs_properties_get(props, "background_color");
 	if (pp)
-		obs_property_set_visible(pp, type != CBG_SOLID);
+		obs_property_set_visible(pp, type != CBG_NONE);
+	pp = obs_properties_get(props, "background_color2");
+	if (pp)
+		obs_property_set_visible(pp, type != CBG_SOLID && type != CBG_NONE);
 	pp = obs_properties_get(props, "background_angle");
 	if (pp)
 		obs_property_set_visible(pp, type == CBG_LINEAR);
 	return true;
 }
 
-static void add_background_props(obs_properties_t *grp)
+static void add_background_props(obs_properties_t *grp, bool allow_none)
 {
 	obs_property_t *bt = obs_properties_add_list(grp, "background_type",
 						     obs_module_text("Constellations.Background.Type"),
 						     OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	if (allow_none)
+		obs_property_list_add_int(bt, obs_module_text("Constellations.Background.Type.None"), CBG_NONE);
 	obs_property_list_add_int(bt, obs_module_text("Constellations.Background.Type.Solid"), CBG_SOLID);
 	obs_property_list_add_int(bt, obs_module_text("Constellations.Background.Type.Radial"), CBG_RADIAL);
 	obs_property_list_add_int(bt, obs_module_text("Constellations.Background.Type.Linear"), CBG_LINEAR);
@@ -592,8 +609,11 @@ static bool motion_reset_clicked(obs_properties_t *props, obs_property_t *p, voi
 	UNUSED_PARAMETER(props);
 	UNUSED_PARAMETER(p);
 	struct cpat_renderer *r = data;
+	if (!r)
+		return false;
 	r->motion_off_along = 0.0;
 	r->motion_off_perp = 0.0;
+	r->border_march = 0.0;
 	return false;
 }
 
@@ -689,7 +709,7 @@ static bool item_enabled_modified(obs_properties_t *props, obs_property_t *p, ob
 	return true;
 }
 
-static void add_item_group(obs_properties_t *root, struct cpat_renderer *r, int i)
+static void add_item_group(obs_properties_t *root, struct cpat_renderer *r, int i, enum cpat_host host)
 {
 	char key[64];
 	char label[128];
@@ -782,9 +802,15 @@ static void add_item_group(obs_properties_t *root, struct cpat_renderer *r, int 
 	snprintf(key, sizeof(key), "item_%d_rotation", i + 1);
 	obs_properties_add_float_slider(grp, key, obs_module_text("Constellations.Item.Rotation"), 0.0, 360.0, 1.0);
 	snprintf(key, sizeof(key), "item_%d_offset_x", i + 1);
-	obs_properties_add_float_slider(grp, key, obs_module_text("Constellations.Item.OffsetX"), -1000.0, 1000.0, 1.0);
+	obs_property_t *ox = obs_properties_add_float_slider(grp, key, obs_module_text("Constellations.Item.OffsetX"),
+							     -1000.0, 1000.0, 1.0);
 	snprintf(key, sizeof(key), "item_%d_offset_y", i + 1);
-	obs_properties_add_float_slider(grp, key, obs_module_text("Constellations.Item.OffsetY"), -1000.0, 1000.0, 1.0);
+	obs_property_t *oy = obs_properties_add_float_slider(grp, key, obs_module_text("Constellations.Item.OffsetY"),
+							     -1000.0, 1000.0, 1.0);
+	if (host == CPAT_HOST_BORDER) {
+		obs_property_set_long_description(ox, obs_module_text("Constellations.Border.OffsetX.Tooltip"));
+		obs_property_set_long_description(oy, obs_module_text("Constellations.Border.OffsetY.Tooltip"));
+	}
 	snprintf(key, sizeof(key), "item_%d_density", i + 1);
 	obs_properties_add_float_slider(grp, key, obs_module_text("Constellations.Item.Density"), 0.1, 20.0, 0.1);
 
@@ -835,13 +861,13 @@ static void add_item_group(obs_properties_t *root, struct cpat_renderer *r, int 
 	obs_properties_add_group(root, gid, label, OBS_GROUP_NORMAL, grp);
 }
 
-void cpat_renderer_get_properties(struct cpat_renderer *r, obs_properties_t *props, bool include_canvas)
+void cpat_renderer_get_properties(struct cpat_renderer *r, obs_properties_t *props, enum cpat_host host)
 {
-	if (include_canvas) {
+	if (host == CPAT_HOST_SOURCE) {
 		obs_properties_t *canvas = obs_properties_create();
 		obs_properties_add_int(canvas, "width", obs_module_text("Constellations.Canvas.Width"), 1, 8192, 1);
 		obs_properties_add_int(canvas, "height", obs_module_text("Constellations.Canvas.Height"), 1, 8192, 1);
-		add_background_props(canvas);
+		add_background_props(canvas, false);
 		obs_properties_add_float_slider(canvas, "anchor_x_pct", obs_module_text("Constellations.Anchor.X"), 0.0,
 						100.0, 0.5);
 		obs_properties_add_float_slider(canvas, "anchor_y_pct", obs_module_text("Constellations.Anchor.Y"), 0.0,
@@ -851,7 +877,15 @@ void cpat_renderer_get_properties(struct cpat_renderer *r, obs_properties_t *pro
 		obs_properties_add_group(props, "canvas_group", obs_module_text("Constellations.Group.Canvas"),
 					 OBS_GROUP_NORMAL, canvas);
 	} else {
-		add_background_props(props);
+		if (host == CPAT_HOST_BORDER) {
+			obs_properties_t *fill = obs_properties_create();
+			add_background_props(fill, true);
+			obs_properties_add_group(props, "border_fill_group",
+						 obs_module_text("Constellations.Group.BorderFill"), OBS_GROUP_NORMAL,
+						 fill);
+		} else {
+			add_background_props(props, false);
+		}
 		obs_properties_add_float_slider(props, "anchor_x_pct", obs_module_text("Constellations.Anchor.X"), 0.0,
 						100.0, 0.5);
 		obs_properties_add_float_slider(props, "anchor_y_pct", obs_module_text("Constellations.Anchor.Y"), 0.0,
@@ -878,13 +912,15 @@ void cpat_renderer_get_properties(struct cpat_renderer *r, obs_properties_t *pro
 	obs_property_list_add_int(go, obs_module_text("Constellations.Layout.GridOrder.Ordered"), CGRID_ORDERED);
 
 	for (int i = 0; i < CONSTELLATIONS_MAX_ITEMS; ++i)
-		add_item_group(props, r, i);
+		add_item_group(props, r, i, host);
 
 	obs_properties_t *motion = obs_properties_create();
 	obs_properties_add_float_slider(motion, "motion_angle", obs_module_text("Constellations.Motion.Angle"), 0.0,
 					360.0, 1.0);
-	obs_properties_add_float_slider(motion, "motion_speed", obs_module_text("Constellations.Motion.Speed"), -500.0,
-					500.0, 1.0);
+	obs_property_t *ms = obs_properties_add_float_slider(
+		motion, "motion_speed", obs_module_text("Constellations.Motion.Speed"), -500.0, 500.0, 1.0);
+	if (host == CPAT_HOST_BORDER)
+		obs_property_set_long_description(ms, obs_module_text("Constellations.Border.MotionSpeed.Tooltip"));
 	obs_properties_add_button2(motion, "motion_reset", obs_module_text("Constellations.Motion.Reset"),
 				   motion_reset_clicked, r);
 	obs_properties_add_bool(motion, "alternating_lines", obs_module_text("Constellations.Motion.Alternating"));
@@ -927,6 +963,10 @@ void cpat_renderer_get_properties(struct cpat_renderer *r, obs_properties_t *pro
 	obs_properties_add_int_slider(ar, "autorot_seed", obs_module_text("Constellations.AutoRot.Seed"), 0, 1000, 1);
 	obs_properties_add_group(props, "autorot_group", obs_module_text("Constellations.Group.AutoRotation"),
 				 OBS_GROUP_NORMAL, ar);
+
+	/* The border's inner edge softness covers what a vignette would do. */
+	if (host == CPAT_HOST_BORDER)
+		return;
 
 	obs_properties_t *vg = obs_properties_create();
 	obs_property_t *ve =
@@ -1038,9 +1078,9 @@ static void cpat_item_update(struct cpat_item *it, obs_data_t *settings, int ind
 #undef IK
 }
 
-void cpat_renderer_update(struct cpat_renderer *r, obs_data_t *settings, bool include_canvas)
+void cpat_renderer_update(struct cpat_renderer *r, obs_data_t *settings)
 {
-	if (include_canvas) {
+	if (r->host == CPAT_HOST_SOURCE) {
 		r->width = (uint32_t)obs_data_get_int(settings, "width");
 		r->height = (uint32_t)obs_data_get_int(settings, "height");
 		if (r->width == 0)
@@ -1052,8 +1092,9 @@ void cpat_renderer_update(struct cpat_renderer *r, obs_data_t *settings, bool in
 	vec4_from_rgba(&r->background_color, (uint32_t)obs_data_get_int(settings, "background_color"));
 	vec4_from_rgba(&r->background_color2, (uint32_t)obs_data_get_int(settings, "background_color2"));
 	r->background_angle_deg = (float)obs_data_get_double(settings, "background_angle");
-	r->has_background = r->background_color.w > 0.0001f ||
-			    (r->background_type != CBG_SOLID && r->background_color2.w > 0.0001f);
+	r->has_background = r->background_type != CBG_NONE &&
+			    (r->background_color.w > 0.0001f ||
+			     (r->background_type != CBG_SOLID && r->background_color2.w > 0.0001f));
 	r->anchor_x_pct = (float)obs_data_get_double(settings, "anchor_x_pct");
 	r->anchor_y_pct = (float)obs_data_get_double(settings, "anchor_y_pct");
 	r->canvas_rotation_deg = (float)obs_data_get_double(settings, "canvas_rotation");
@@ -1097,6 +1138,8 @@ void cpat_renderer_update(struct cpat_renderer *r, obs_data_t *settings, bool in
 	r->vignette_polygon_sides = (int)obs_data_get_int(settings, "vignette_polygon_sides");
 	r->vignette_softness = (float)obs_data_get_double(settings, "vignette_softness");
 	r->vignette_inverted = obs_data_get_bool(settings, "vignette_inverted");
+	if (r->host == CPAT_HOST_BORDER)
+		r->vignette_enabled = false;
 }
 
 void cpat_renderer_tick(struct cpat_renderer *r, float seconds)
@@ -1113,6 +1156,7 @@ void cpat_renderer_tick(struct cpat_renderer *r, float seconds)
 	double step = (double)r->motion_speed * (double)seconds;
 	r->motion_off_along += cos(ang) * step;
 	r->motion_off_perp += sin(ang) * step;
+	r->border_march += step;
 	r->elapsed_time += (double)seconds;
 
 	uint32_t count = r->item_count;
@@ -1133,6 +1177,56 @@ void cpat_renderer_tick(struct cpat_renderer *r, float seconds)
 		}
 		obs_source_release(src);
 	}
+}
+
+void cpat_border_corner_radii(const struct cpat_renderer *r, uint32_t w, uint32_t h, struct vec4 *outer,
+			      struct vec4 *inner)
+{
+	const struct cpat_border *b = &r->border;
+	float half_min = 0.5f * (float)(w < h ? w : h);
+	float rc = b->radius < 0.0f ? 0.0f : b->radius;
+	if (rc > half_min)
+		rc = half_min;
+	vec4_set(outer, rc, rc, rc, rc);
+	/* Each inner corner stays concentric with the outer one, shrunk by the
+	 * wider of the two sides meeting there. */
+	vec4_set(inner, fmaxf(rc - fmaxf(b->left, b->top), 0.0f), fmaxf(rc - fmaxf(b->right, b->top), 0.0f),
+		 fmaxf(rc - fmaxf(b->right, b->bottom), 0.0f), fmaxf(rc - fmaxf(b->left, b->bottom), 0.0f));
+}
+
+static void set_effect_float(gs_effect_t *effect, const char *name, float v)
+{
+	gs_eparam_t *p = gs_effect_get_param_by_name(effect, name);
+	if (p)
+		gs_effect_set_float(p, v);
+}
+
+static void set_effect_vec4(gs_effect_t *effect, const char *name, const struct vec4 *v)
+{
+	gs_eparam_t *p = gs_effect_get_param_by_name(effect, name);
+	if (p)
+		gs_effect_set_vec4(p, v);
+}
+
+static void set_border_uniforms(struct cpat_renderer *r, uint32_t w, uint32_t h)
+{
+	const struct cpat_border *b = &r->border;
+	set_effect_float(r->effect, "border_active", b->active ? 1.0f : 0.0f);
+	if (!b->active)
+		return;
+	struct vec4 widths, outer, inner;
+	vec4_set(&widths, b->left, b->top, b->right, b->bottom);
+	cpat_border_corner_radii(r, w, h, &outer, &inner);
+	set_effect_vec4(r->effect, "border_widths", &widths);
+	set_effect_float(r->effect, "border_radius", outer.x);
+	set_effect_vec4(r->effect, "border_inner_radii", &inner);
+	set_effect_float(r->effect, "border_softness", b->softness);
+	/* A masked lattice would cover the whole source, so it always clips. */
+	set_effect_float(r->effect, "border_clip", (b->clip || b->layout == CBORDER_MASKED) ? 1.0f : 0.0f);
+	set_effect_float(r->effect, "border_rows", (float)b->rows);
+	set_effect_float(r->effect, "border_stagger", b->stagger_rows ? 1.0f : 0.0f);
+	set_effect_float(r->effect, "border_align", b->align ? 1.0f : 0.0f);
+	set_effect_float(r->effect, "border_march", (float)r->border_march);
 }
 
 void cpat_renderer_render_background(struct cpat_renderer *r, uint32_t w, uint32_t h)
@@ -1158,6 +1252,7 @@ void cpat_renderer_render_background(struct cpat_renderer *r, uint32_t w, uint32
 	p = gs_effect_get_param_by_name(r->effect, "bg_dir");
 	if (p)
 		gs_effect_set_vec2(p, &dir);
+	set_border_uniforms(r, w, h);
 
 	gs_blend_state_push();
 	gs_blend_function(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA);
@@ -1429,6 +1524,9 @@ void cpat_renderer_render_items(struct cpat_renderer *r, uint32_t w, uint32_t h)
 			render_item_source_to_texrender(it);
 	}
 
+	set_border_uniforms(r, w, h);
+	const bool perimeter = r->border.active && r->border.layout == CBORDER_PERIMETER;
+
 	gs_blend_state_push();
 	gs_blend_function(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA);
 
@@ -1440,19 +1538,20 @@ void cpat_renderer_render_items(struct cpat_renderer *r, uint32_t w, uint32_t h)
 		uint32_t this_step_index = next_step_index++;
 
 		gs_texture_t *tex = NULL;
-		const char *technique = "DrawShape";
+		const char *technique = perimeter ? "DrawBorderShape" : "DrawShape";
+		const char *image_technique = perimeter ? "DrawBorderImage" : "DrawImage";
 		if (it->kind == CITEM_IMAGE) {
 			tex = cpat_item_image_texture(it);
 			if (!tex)
 				continue;
-			technique = "DrawImage";
+			technique = image_technique;
 		} else if (it->kind == CITEM_SOURCE) {
 			if (!it->source_texrender)
 				continue;
 			tex = gs_texrender_get_texture(it->source_texrender);
 			if (!tex)
 				continue;
-			technique = "DrawImage";
+			technique = image_technique;
 		}
 
 		set_common_uniforms(r, it, w, h, (int)i, this_step_index, step_count, shared_density);

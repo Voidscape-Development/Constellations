@@ -67,8 +67,32 @@ struct cpat_item {
 	float autorot_seed;
 };
 
+/* Which plugin type is hosting the renderer. It decides the defaults and
+ * which property groups are shown. */
+enum cpat_host {
+	CPAT_HOST_SOURCE = 0,
+	CPAT_HOST_FILTER = 1,
+	CPAT_HOST_BORDER = 2,
+};
+
+/* Frame geometry for the Pattern Border filter. The frame always spans the
+ * whole output; the band is the area between its outer edge and the inner
+ * edge inset by the per-side widths. */
+struct cpat_border {
+	bool active;
+	int layout;
+	float left, top, right, bottom;
+	float radius;
+	float softness;
+	bool clip;
+	int rows;
+	bool stagger_rows;
+	bool align;
+};
+
 struct cpat_renderer {
 	obs_source_t *owner;
+	enum cpat_host host;
 
 	uint32_t width, height;
 	bool has_background;
@@ -121,16 +145,26 @@ struct cpat_renderer {
 	double motion_off_along, motion_off_perp;
 	double elapsed_time;
 
+	/* Pattern Border only: the band geometry, and how far (px) the shapes
+	 * have marched along the frame (positive is clockwise). */
+	struct cpat_border border;
+	double border_march;
+
 	gs_effect_t *effect;
 };
 
-void cpat_renderer_init(struct cpat_renderer *r, obs_source_t *owner);
+void cpat_renderer_init(struct cpat_renderer *r, obs_source_t *owner, enum cpat_host host);
 void cpat_renderer_free(struct cpat_renderer *r);
 
-void cpat_renderer_set_defaults(obs_data_t *settings, bool include_canvas);
-void cpat_renderer_get_properties(struct cpat_renderer *r, obs_properties_t *props, bool include_canvas);
-void cpat_renderer_update(struct cpat_renderer *r, obs_data_t *settings, bool include_canvas);
+void cpat_renderer_set_defaults(obs_data_t *settings, enum cpat_host host);
+void cpat_renderer_get_properties(struct cpat_renderer *r, obs_properties_t *props, enum cpat_host host);
+void cpat_renderer_update(struct cpat_renderer *r, obs_data_t *settings);
 
 void cpat_renderer_tick(struct cpat_renderer *r, float seconds);
 void cpat_renderer_render_background(struct cpat_renderer *r, uint32_t w, uint32_t h);
 void cpat_renderer_render_items(struct cpat_renderer *r, uint32_t w, uint32_t h);
+
+/* Corner radii (top-left, top-right, bottom-right, bottom-left) of the
+ * border's outer and inner edges for a w x h frame. */
+void cpat_border_corner_radii(const struct cpat_renderer *r, uint32_t w, uint32_t h, struct vec4 *outer,
+			      struct vec4 *inner);
