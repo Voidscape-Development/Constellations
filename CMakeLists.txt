@@ -43,6 +43,7 @@ target_sources(
     src/topography-source.c
     src/skylines-source.c
     src/pattern-filter.c
+    src/pattern-border.c
     src/shapes-transition.c
     src/svg-image.c
     src/nanosvg-impl.c

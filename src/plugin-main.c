@@ -42,6 +42,7 @@ bool obs_module_load(void)
 	constellations_register_topography_filter();
 	constellations_register_skylines();
 	constellations_register_pattern_filter();
+	constellations_register_pattern_border();
 	constellations_register_shapes_transition();
 	obs_log(LOG_INFO, "Constellations loaded");
 	return true;

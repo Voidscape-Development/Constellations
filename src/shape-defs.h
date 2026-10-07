@@ -41,6 +41,7 @@ enum constellations_background_type {
 	CBG_SOLID = 0,
 	CBG_RADIAL = 1,
 	CBG_LINEAR = 2,
+	CBG_NONE = 3,
 };
 
 enum constellations_vignette_shape {
@@ -119,6 +120,16 @@ enum constellations_tiling_mode {
 	CTILE_TIGHT = 1,
 };
 
+enum constellations_border_position {
+	CBORDER_INSIDE = 0,
+	CBORDER_OUTSIDE = 1,
+};
+
+enum constellations_border_layout {
+	CBORDER_PERIMETER = 0,
+	CBORDER_MASKED = 1,
+};
+
 #define CONSTELLATIONS_MAX_ITEMS 32
 
 void constellations_register_pattern_source(void);
@@ -126,4 +137,5 @@ void constellations_register_topography_source(void);
 void constellations_register_topography_filter(void);
 void constellations_register_skylines(void);
 void constellations_register_pattern_filter(void);
+void constellations_register_pattern_border(void);
 void constellations_register_shapes_transition(void);
