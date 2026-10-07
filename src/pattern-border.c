@@ -57,7 +57,7 @@ static void cpat_border_read_settings(struct cpat_border_filter *f, obs_data_t *
 	if (b->rows > 8)
 		b->rows = 8;
 	b->stagger_rows = obs_data_get_bool(settings, "border_stagger");
-	b->align = obs_data_get_bool(settings, "border_align");
+	b->align = (int)obs_data_get_int(settings, "border_orientation") == CBORDER_ORIENT_FOLLOW_EDGE;
 }
 
 static void *cpat_border_create(obs_data_t *settings, obs_source_t *source)
@@ -200,7 +200,7 @@ static bool border_visibility_modified(obs_properties_t *props, obs_property_t *
 	bool perimeter = (int)obs_data_get_int(settings, "border_layout") == CBORDER_PERIMETER;
 	set_visible(props, "border_rows", perimeter);
 	set_visible(props, "border_stagger", perimeter);
-	set_visible(props, "border_align", perimeter);
+	set_visible(props, "border_orientation", perimeter);
 	set_visible(props, "border_clip", perimeter);
 	set_visible(props, "anchor_x_pct", !perimeter);
 	set_visible(props, "anchor_y_pct", !perimeter);
@@ -246,8 +246,13 @@ static obs_properties_t *cpat_border_props(void *data)
 
 	obs_properties_add_int_slider(grp, "border_rows", obs_module_text("Constellations.Border.Rows"), 1, 8, 1);
 	obs_properties_add_bool(grp, "border_stagger", obs_module_text("Constellations.Border.Stagger"));
-	p = obs_properties_add_bool(grp, "border_align", obs_module_text("Constellations.Border.Align"));
-	obs_property_set_long_description(p, obs_module_text("Constellations.Border.Align.Tooltip"));
+	p = obs_properties_add_list(grp, "border_orientation", obs_module_text("Constellations.Border.Orientation"),
+				    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(p, obs_module_text("Constellations.Border.Orientation.Uniform"),
+				  CBORDER_ORIENT_UNIFORM);
+	obs_property_list_add_int(p, obs_module_text("Constellations.Border.Orientation.FollowEdge"),
+				  CBORDER_ORIENT_FOLLOW_EDGE);
+	obs_property_set_long_description(p, obs_module_text("Constellations.Border.Orientation.Tooltip"));
 	p = obs_properties_add_bool(grp, "border_clip", obs_module_text("Constellations.Border.Clip"));
 	obs_property_set_long_description(p, obs_module_text("Constellations.Border.Clip.Tooltip"));
 
@@ -273,7 +278,7 @@ static void cpat_border_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "border_layout", CBORDER_PERIMETER);
 	obs_data_set_default_int(settings, "border_rows", 1);
 	obs_data_set_default_bool(settings, "border_stagger", false);
-	obs_data_set_default_bool(settings, "border_align", true);
+	obs_data_set_default_int(settings, "border_orientation", CBORDER_ORIENT_UNIFORM);
 	obs_data_set_default_bool(settings, "border_clip", true);
 	cpat_renderer_set_defaults(settings, CPAT_HOST_BORDER);
 }

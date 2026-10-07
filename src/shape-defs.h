@@ -125,6 +125,11 @@ enum constellations_border_position {
 	CBORDER_OUTSIDE = 1,
 };
 
+enum constellations_border_orientation {
+	CBORDER_ORIENT_UNIFORM = 0,
+	CBORDER_ORIENT_FOLLOW_EDGE = 1,
+};
+
 enum constellations_border_layout {
 	CBORDER_PERIMETER = 0,
 	CBORDER_MASKED = 1,
