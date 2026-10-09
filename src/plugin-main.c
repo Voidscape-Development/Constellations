@@ -26,7 +26,7 @@ OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 
 MODULE_EXPORT const char *obs_module_description(void)
 {
-	return "Constellations — tiled shape backgrounds, filters, and shape-based transitions for OBS.";
+	return "Constellations — tiled shape backgrounds, procedural skies, filters, and shape-based transitions for OBS.";
 }
 
 MODULE_EXPORT const char *obs_module_name(void)
@@ -44,6 +44,7 @@ bool obs_module_load(void)
 	constellations_register_pattern_filter();
 	constellations_register_pattern_border();
 	constellations_register_shapes_transition();
+	constellations_register_skybox();
 	obs_log(LOG_INFO, "Constellations loaded");
 	return true;
 }
