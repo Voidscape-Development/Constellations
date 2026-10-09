@@ -1,0 +1,580 @@
+// Constellations - Procedural skybox (time of day, weather, sky extras)
+// (c) 2026 Eion Dailey - GPLv2+
+//
+// Every position below is in "height units": x runs 0..aspect and y runs
+// 0..1 from the top edge, so shapes stay round on any canvas size. All the
+// time-of-day / weather / theme logic lives on the CPU (skybox-model.c),
+// which hands this shader ready-mixed colors and visibilities.
+//
+// Anything that scrolls forever (clouds, fog, rain, snow, aurora) uses
+// lattice noise that repeats every 64 cells, and the CPU wraps the matching
+// offsets at that period, so float precision never degrades however long the
+// source stays live.
+
+uniform float4x4 ViewProj;
+
+uniform float2 canvas_size;
+uniform float noise_seed;  // 0..1000, folded into every hash
+uniform float style_flat;  // 1 = flat / cel-shaded, 0 = soft
+uniform float sky_bands;   // flat style: number of gradient bands
+uniform float draw_sky;    // 0 = weather effects only, over transparency
+
+uniform float4 sky_top;
+uniform float4 sky_horizon;
+
+uniform float2 sun_pos;    // height units
+uniform float sun_radius;  // height units
+uniform float4 sun_color;
+uniform float sun_alpha;   // disc visibility
+uniform float sun_glow;    // sky glow strength around the sun
+
+uniform float2 moon_pos;
+uniform float moon_radius;
+uniform float moon_phase;  // 0 new, 0.25 first quarter, 0.5 full, 0.75 last quarter
+uniform float moon_alpha;
+uniform float4 moon_color;
+
+uniform float star_alpha;
+uniform float star_density;      // 0..1 fraction of cells holding a star
+uniform float star_twinkle;      // accumulated twinkle cycles
+uniform float4 shoot_a;          // head xy, unit direction xy
+uniform float4 shoot_b;          // tail length, alpha
+
+uniform float aurora_alpha;
+uniform float4 aurora_color1;    // lower edge
+uniform float4 aurora_color2;    // ray tops
+uniform float aurora_phase;      // 0..1, wraps
+
+uniform float rainbow_alpha;
+uniform float2 rainbow_center;
+uniform float rainbow_radius;
+
+uniform float cloud_cover;       // 0 clear .. 1 solid deck
+uniform float cloud_scale;
+uniform float2 cloud_offset;     // wrapped to the 64-cell noise period
+uniform float2 cloud_light_dir;  // toward the sun or moon, in cloud space
+uniform float4 cloud_lit;
+uniform float4 cloud_shade;
+
+uniform float4 flock_a;          // center xy, heading (+1 right / -1 left), flap phase
+uniform float4 flock_b;          // bird count, size, alpha, flock seed
+uniform float4 bird_color;
+
+uniform float4 bolt;             // x, seed, alpha, unused
+uniform float flash;             // lightning sky flash 0..1
+
+uniform float rain_amount;
+uniform float rain_slant;        // horizontal travel per unit of fall
+uniform float4 rain_off;         // per-layer fall offset in cells, wrapped
+uniform float4 rain_color;
+
+uniform float snow_amount;
+uniform float4 snow_off_y;       // per-layer fall offset in cells, wrapped
+uniform float4 snow_off_x;       // per-layer wind drift in cells, wrapped
+uniform float snow_phase;        // accumulated sway cycles
+
+uniform float fog_amount;
+uniform float4 fog_color;
+uniform float2 fog_offset;
+
+uniform float4 grade;            // saturation, brightness, monochrome amount, unused
+uniform float4 mono_tint;
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData v_out;
+	v_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	v_out.uv  = v_in.uv;
+	return v_out;
+}
+
+// ---------------------------------------------------------------- noise ----
+
+float hash12(float2 p)
+{
+	p += float2(noise_seed, noise_seed * 1.37);
+	float3 p3 = frac(float3(p.x, p.y, p.x) * 0.1031);
+	p3 += dot(p3, float3(p3.y, p3.z, p3.x) + 33.33);
+	return frac((p3.x + p3.y) * p3.z);
+}
+
+float wrapc(float i, float per)
+{
+	return i - per * floor(i / per);
+}
+
+float vnoise(float2 p, float per)
+{
+	float2 i = floor(p);
+	float2 f = frac(p);
+	float2 u = f * f * (3.0 - 2.0 * f);
+	float x0 = wrapc(i.x, per);
+	float y0 = wrapc(i.y, per);
+	float x1 = wrapc(i.x + 1.0, per);
+	float y1 = wrapc(i.y + 1.0, per);
+	float a = hash12(float2(x0, y0));
+	float b = hash12(float2(x1, y0));
+	float c = hash12(float2(x0, y1));
+	float d = hash12(float2(x1, y1));
+	return lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y);
+}
+
+// Each octave doubles both the frequency and the lattice period, so the sum
+// still repeats every 64 base cells.
+float fbm(float2 p, int octaves)
+{
+	float v = 0.0;
+	float amp = 0.5;
+	float norm = 0.0;
+	float per = 64.0;
+	for (int k = 0; k < octaves; ++k) {
+		v += amp * vnoise(p, per);
+		norm += amp;
+		p = p * 2.0 + float2(17.0, 9.0);
+		per *= 2.0;
+		amp *= 0.5;
+	}
+	return v / norm;
+}
+
+// ------------------------------------------------------------- helpers ----
+
+float4 over(float4 dst, float3 rgb, float a)
+{
+	a = saturate(a);
+	float oa = a + dst.a * (1.0 - a);
+	if (oa < 1.0e-5)
+		return float4(0.0, 0.0, 0.0, 0.0);
+	float3 c = (rgb * a + dst.rgb * dst.a * (1.0 - a)) / oa;
+	return float4(c, oa);
+}
+
+// Coverage of an edge at signed distance d (in pixels): 1 px antialiasing in
+// flat style, a wider feather in soft style.
+float edge(float d, float soft_px)
+{
+	float w = lerp(soft_px, 0.75, style_flat);
+	return 1.0 - smoothstep(-w, w, d);
+}
+
+float posterize(float v, float n)
+{
+	return floor(v * n + 0.5) / n;
+}
+
+float3 hue_rgb(float h)
+{
+	float3 k = abs(frac(float3(h, h, h) + float3(0.0, 0.6666667, 0.3333333)) * 6.0 - 3.0) - 1.0;
+	return saturate(k);
+}
+
+float seg_dist(float2 p, float2 a, float2 b)
+{
+	float2 pa = p - a;
+	float2 ba = b - a;
+	float t = saturate(dot(pa, ba) / max(dot(ba, ba), 1.0e-6));
+	return length(pa - ba * t);
+}
+
+// ----------------------------------------------------------------- sky ----
+
+float3 sky_gradient(float h)
+{
+	// h: 0 at the bottom edge, 1 at the top.
+	float t = saturate(h);
+	if (style_flat > 0.5)
+		t = (floor(t * sky_bands) + 0.5) / sky_bands;
+	t = pow(t, 0.65);
+	return lerp(sky_horizon.rgb, sky_top.rgb, t);
+}
+
+float3 add_glows(float3 col, float2 p, float px)
+{
+	// Broad glow the sun throws on the sky, strongest near the horizon (the
+	// CPU raises sun_glow at low elevations). It still shines while the disc
+	// sits just below the bottom edge, which gives the twilight wash.
+	float ds = length(p - sun_pos);
+	float g = sun_glow * (exp(-ds * 2.6) * 0.55 + exp(-ds * 9.0) * 0.45);
+	if (style_flat > 0.5)
+		g = floor(g * sky_bands * 0.75) / (sky_bands * 0.75);
+	col = 1.0 - (1.0 - col) * (1.0 - saturate(sun_color.rgb * g));
+
+	float lit = 0.5 - 0.5 * cos(moon_phase * 6.2831853);
+	float dm = length(p - moon_pos);
+	float mg = moon_alpha * lit * exp(-dm / max(moon_radius * 3.5, 1.0e-4)) * 0.35;
+	if (style_flat > 0.5)
+		mg = floor(mg * 6.0) / 6.0;
+	col = 1.0 - (1.0 - col) * (1.0 - saturate(moon_color.rgb * mg));
+	return col;
+}
+
+float4 draw_stars(float4 acc, float2 frag_px, float h)
+{
+	float cell_px = max(14.0, canvas_size.y * 0.022);
+	float2 c = floor(frag_px / cell_px);
+	float2 f = frac(frag_px / cell_px);
+	float r0 = hash12(c + 3.1);
+	if (r0 > star_density)
+		return acc;
+	float2 ctr = 0.2 + 0.6 * float2(hash12(c + 7.7), hash12(c + 13.3));
+	float bright = hash12(c + 21.9);
+	float rad = 0.6 + 1.5 * bright * bright * bright;
+	float2 d = (f - ctr) * cell_px;
+	float dist = length(d);
+	float a = edge(dist - rad, rad * 0.8);
+
+	// Bright stars get a small four-point flare.
+	if (bright > 0.9) {
+		float arm = rad * 4.0;
+		float fl = max(saturate(1.0 - abs(d.x) / arm) * saturate(1.0 - abs(d.y) / 0.9),
+			       saturate(1.0 - abs(d.y) / arm) * saturate(1.0 - abs(d.x) / 0.9));
+		a = max(a, fl * 0.8);
+	}
+
+	float rate = 0.5 + 1.5 * hash12(c + 31.7);
+	float tw = 0.65 + 0.35 * sin((star_twinkle * rate + hash12(c + 41.3)) * 6.2831853);
+	float horizon_fade = smoothstep(0.02, 0.35, h);
+	float3 tint = lerp(float3(0.75, 0.85, 1.0), float3(1.0, 0.92, 0.8), hash12(c + 51.1));
+	return over(acc, tint, a * tw * horizon_fade * star_alpha * (0.55 + 0.45 * bright));
+}
+
+float4 draw_shooting_star(float4 acc, float2 p, float px)
+{
+	if (shoot_b.y <= 0.0)
+		return acc;
+	float2 head = shoot_a.xy;
+	float2 dir = shoot_a.zw;
+	float2 rel = p - head;
+	float along = -dot(rel, dir); // distance behind the head
+	float side = abs(rel.x * dir.y - rel.y * dir.x);
+	if (along < -px * 3.0 || along > shoot_b.x)
+		return acc;
+	float taper = 1.0 - saturate(along / shoot_b.x);
+	float w = px * (0.6 + 1.6 * taper);
+	float a = edge(side - w, w) * taper * taper;
+	float headglow = exp(-length(rel) / (px * 3.0));
+	return over(acc, float3(1.0, 0.97, 0.9), (a + headglow) * shoot_b.y);
+}
+
+float4 draw_aurora(float4 acc, float2 p)
+{
+	if (aurora_alpha <= 0.0)
+		return acc;
+	float ph = aurora_phase * 6.2831853;
+	float t64 = aurora_phase * 64.0;
+	float total = 0.0;
+	float topness = 0.0;
+	for (int k = 0; k < 2; ++k) {
+		float fk = float(k);
+		// Bright lower edge: a slow sway plus a drifting noise wobble.
+		float edge_y = 0.33 + 0.12 * fk + 0.06 * sin(p.x * (0.9 + 0.5 * fk) + ph * (2.0 + fk) + fk * 2.1) +
+			       0.04 * sin(p.x * 2.7 - ph * 3.0 + fk) +
+			       0.1 * (vnoise(float2(p.x * 1.2 + fk * 9.0, t64), 64.0) - 0.5);
+		float up = edge_y - p.y; // distance above the edge
+		// Rays: fine vertical streaks of varying brightness and length.
+		float rx = p.x * 22.0 + 1.5 * sin(p.x * 3.0 + ph * 4.0) + fk * 40.0;
+		float rays = fbm(float2(rx, t64 * 2.0), 3);
+		rays = smoothstep(0.25, 0.85, rays);
+		float height = (0.13 + 0.05 * fk) * (0.45 + 0.9 * fbm(float2(p.x * 4.0 + fk * 3.0, t64), 2));
+		float body = step(0.0, up) * exp(-up / height) * (0.25 + 0.75 * rays);
+		body += exp(-up * up / 0.0006) * 0.25 * (0.5 + rays);
+		// Patches along the width, so the curtain thins and brightens.
+		float patchy = smoothstep(0.15, 0.55, vnoise(float2(p.x * 0.7 + fk * 5.0, t64 * 0.5), 64.0));
+		float v = body * patchy * (1.0 - 0.3 * fk);
+		total += v;
+		topness += v * saturate(up / max(height, 1.0e-3));
+	}
+	topness = saturate(topness / max(total, 1.0e-4));
+	float a = saturate(total) * aurora_alpha;
+	if (style_flat > 0.5)
+		a = posterize(a, 4.0);
+	float3 col = lerp(aurora_color1.rgb, aurora_color2.rgb, topness);
+	return float4(1.0 - (1.0 - acc.rgb) * (1.0 - saturate(col * a)), acc.a);
+}
+
+float4 draw_sun(float4 acc, float2 p, float px)
+{
+	if (sun_alpha <= 0.0)
+		return acc;
+	float d = length(p - sun_pos);
+	float3 core = saturate(sun_color.rgb * 1.15 + 0.1);
+	float a;
+	if (style_flat > 0.5) {
+		// Crisp disc with two flat halo rings.
+		acc = over(acc, sun_color.rgb, edge((d - sun_radius * 2.2) / px, 1.0) * 0.12 * sun_alpha);
+		acc = over(acc, sun_color.rgb, edge((d - sun_radius * 1.55) / px, 1.0) * 0.2 * sun_alpha);
+		a = edge((d - sun_radius) / px, 1.0);
+	} else {
+		a = edge((d - sun_radius) / px, 1.5);
+		float halo = exp(-max(d - sun_radius, 0.0) / (sun_radius * 0.9)) * 0.55;
+		acc = float4(1.0 - (1.0 - acc.rgb) * (1.0 - saturate(sun_color.rgb * halo * sun_alpha)), acc.a);
+	}
+	return over(acc, core, a * sun_alpha);
+}
+
+float4 draw_moon(float4 acc, float2 p, float px)
+{
+	if (moon_alpha <= 0.0)
+		return acc;
+	float2 d = (p - moon_pos) / moon_radius;
+	float r = length(d);
+	if (r > 1.3)
+		return acc;
+	float disc = edge((r - 1.0) * moon_radius / px, 1.2);
+
+	float e = max(px / moon_radius, 0.01) * 1.5;
+	float s = sqrt(saturate(1.0 - d.y * d.y));
+	float xt = cos(moon_phase * 6.2831853) * s;
+	float lit_wax = smoothstep(xt - e, xt + e, d.x);
+	float lit_wane = 1.0 - smoothstep(-xt - e, -xt + e, d.x);
+	float lit = lerp(lit_wane, lit_wax, step(moon_phase, 0.5));
+	if (style_flat > 0.5)
+		lit = step(0.5, lit);
+
+	float crater = fbm(d * 1.9 + float2(3.7, 8.1), 3);
+	float shade = 1.0 - 0.22 * smoothstep(0.5, 0.68, crater);
+	if (style_flat > 0.5)
+		shade = 1.0 - 0.14 * step(0.58, crater);
+
+	float3 earthshine = acc.rgb * 1.15 + float3(0.02, 0.025, 0.04);
+	float3 col = lerp(earthshine, moon_color.rgb * shade, lit);
+	return over(acc, col, disc * moon_alpha);
+}
+
+float4 draw_rainbow(float4 acc, float2 p)
+{
+	if (rainbow_alpha <= 0.0)
+		return acc;
+	float r = length(p - rainbow_center);
+	float bw = rainbow_radius * 0.09;
+	float t = (r - (rainbow_radius - bw)) / bw; // 0 inner (violet) .. 1 outer (red)
+	if (t < 0.0 || t > 1.0)
+		return acc;
+	float tq = t;
+	if (style_flat > 0.5)
+		tq = (floor(t * 6.0) + 0.5) / 6.0;
+	float3 col = hue_rgb((1.0 - tq) * 0.78);
+	float a = rainbow_alpha * 0.42;
+	if (style_flat < 0.5)
+		a *= smoothstep(0.0, 0.18, t) * (1.0 - smoothstep(0.8, 1.0, t));
+	// Fade the feet into the haze near the bottom edge.
+	a *= (1.0 - smoothstep(0.7, 1.0, p.y));
+	return float4(lerp(acc.rgb, saturate(col * 0.85 + acc.rgb * 0.35), a), acc.a);
+}
+
+// ---------------------------------------------------------------- clouds ----
+
+float4 draw_clouds(float4 acc, float2 uv, float h, float aspect)
+{
+	if (cloud_cover <= 0.0)
+		return acc;
+	// Fake perspective: the cloud deck is a plane, so clouds shrink and
+	// crowd together toward the horizon.
+	float depth = 1.0 / (h * 1.3 + 0.22);
+	float2 q = float2((uv.x - 0.5) * aspect * depth, depth) * cloud_scale + cloud_offset;
+
+	float n = fbm(q, 5);
+	float th = lerp(0.78, 0.22, cloud_cover);
+	float soft = lerp(0.08, 0.02, style_flat);
+	float a = smoothstep(th, th + soft, n);
+	if (a <= 0.0)
+		return acc;
+
+	// Density toward the light: more cloud that way means this point sits in
+	// its own shadow.
+	float n2 = fbm(q + cloud_light_dir * 0.35, 4);
+	float light = saturate(0.7 - (n2 - n) * 4.5 - (n - th) * 1.4);
+	if (style_flat > 0.5)
+		light = posterize(light, 2.0);
+	float3 col = lerp(cloud_shade.rgb, cloud_lit.rgb, light);
+	col = saturate(col + flash * float3(0.55, 0.58, 0.7));
+
+	// Clouds near the horizon fade into the haze.
+	a *= lerp(0.55, 1.0, smoothstep(0.0, 0.3, h));
+	return over(acc, col, a * cloud_lit.a);
+}
+
+// ----------------------------------------------------------------- birds ----
+
+float4 draw_birds(float4 acc, float2 p, float px)
+{
+	if (flock_b.z <= 0.0)
+		return acc;
+	float size = flock_b.y;
+	float best = 1.0e6;
+	for (int i = 0; i < 9; ++i) {
+		float fi = float(i);
+		if (fi >= flock_b.x)
+			break;
+		float rank = floor((fi + 1.0) * 0.5);
+		float side = fi - 2.0 * floor(fi * 0.5); // 0 or 1
+		side = side * 2.0 - 1.0;
+		float2 jit = float2(hash12(float2(fi, flock_b.w)), hash12(float2(fi + 5.0, flock_b.w))) - 0.5;
+		float2 pos = flock_a.xy + float2(-flock_a.z * rank * 3.2, side * rank * 1.9) * size + jit * size * 1.6;
+		float2 l = (p - pos) / size;
+		if (abs(l.x) > 1.6 || abs(l.y) > 1.6)
+			continue;
+		float flap = sin(flock_a.w * 6.2831853 * 2.2 + fi * 1.7);
+		float tip = -0.15 - 0.45 * flap;
+		float elbow = -0.3 - 0.15 * flap;
+		float d = seg_dist(l, float2(-1.0, tip), float2(-0.45, elbow));
+		d = min(d, seg_dist(l, float2(-0.45, elbow), float2(0.0, 0.05)));
+		d = min(d, seg_dist(l, float2(0.0, 0.05), float2(0.45, elbow)));
+		d = min(d, seg_dist(l, float2(0.45, elbow), float2(1.0, tip)));
+		float w = 0.11 * (1.0 - 0.55 * saturate(abs(l.x)));
+		best = min(best, (d - w) * size);
+	}
+	float a = edge(best / px, 0.9);
+	return over(acc, bird_color.rgb, a * flock_b.z * bird_color.a);
+}
+
+// ------------------------------------------------------------- lightning ----
+
+float4 draw_bolt(float4 acc, float2 p, float px)
+{
+	if (bolt.z <= 0.0 || p.y < 0.12)
+		return acc;
+	float y = p.y;
+	float x = bolt.x + 0.18 * (vnoise(float2(y * 3.0, bolt.y), 64.0) - 0.5) +
+		  0.07 * (vnoise(float2(y * 11.0, bolt.y + 7.0), 64.0) - 0.5) +
+		  0.025 * (vnoise(float2(y * 37.0, bolt.y + 13.0), 64.0) - 0.5);
+	float d = abs(p.x - x) / px;
+	float start = smoothstep(0.12, 0.17, y);
+	float core = edge(d - 1.2, 0.8);
+	float glow = exp(-d / 9.0) * 0.5;
+	return over(acc, float3(0.92, 0.95, 1.0), saturate(core + glow) * bolt.z * start);
+}
+
+// ------------------------------------------------------------------- fog ----
+
+float4 draw_fog(float4 acc, float2 p, float h)
+{
+	if (fog_amount <= 0.0)
+		return acc;
+	float n = fbm(float2(p.x * 2.2, h * 5.0) + fog_offset, 3);
+	float shape = 0.4 + 0.6 * (1.0 - smoothstep(0.0, 0.75, h));
+	float a = fog_amount * shape * (0.75 + 0.7 * (n - 0.5));
+	if (style_flat > 0.5)
+		a = posterize(a, 4.0);
+	return over(acc, fog_color.rgb, min(a, 0.95));
+}
+
+// ----------------------------------------------------------- rain / snow ----
+
+float rain_layer(float2 p, float idx, float cw, float ch, float len, float width_px, float px)
+{
+	float xs = p.x - p.y * rain_slant; // constant along a falling streak
+	float col = floor(xs / cw);
+	float fx = frac(xs / cw);
+	float off = rain_off.x;
+	if (idx > 0.5)
+		off = rain_off.y;
+	if (idx > 1.5)
+		off = rain_off.z;
+	float y = p.y / ch - off + hash12(float2(col, idx * 17.0 + 1.0));
+	float row = wrapc(floor(y), 64.0);
+	float ly = frac(y);
+	float2 id = float2(col, row + idx * 101.0);
+	if (hash12(id) > rain_amount)
+		return 0.0;
+	float xr = 0.2 + 0.6 * hash12(id + 5.3);
+	float dx = abs(fx - xr) * cw / px;
+	float a = edge(dx - width_px * 0.5, 0.6);
+	a *= smoothstep(1.0 - len, 1.0, ly) * step(ly, 0.995);
+	return a;
+}
+
+float snow_layer(float2 p, float idx, float cs, float rad_px, float px)
+{
+	float offy = snow_off_y.x;
+	float offx = snow_off_x.x;
+	if (idx > 0.5) {
+		offy = snow_off_y.y;
+		offx = snow_off_x.y;
+	}
+	if (idx > 1.5) {
+		offy = snow_off_y.z;
+		offx = snow_off_x.z;
+	}
+	float2 g = p / cs - float2(offx, offy);
+	float2 cell = float2(wrapc(floor(g.x), 64.0), wrapc(floor(g.y), 64.0)) + float2(0.0, idx * 131.0);
+	float2 f = frac(g);
+	if (hash12(cell) > snow_amount)
+		return 0.0;
+	float2 ctr = 0.3 + 0.4 * float2(hash12(cell + 3.7), hash12(cell + 9.1));
+	ctr.x += 0.17 * sin((snow_phase * (0.6 + 0.8 * hash12(cell + 2.2)) + hash12(cell + 4.4)) * 6.2831853);
+	float d = length(f - ctr) * cs / px;
+	float r = rad_px * (0.7 + 0.6 * hash12(cell + 6.6));
+	return edge(d - r, r * 0.7);
+}
+
+// ------------------------------------------------------------------ main ----
+
+float4 PSSkybox(VertData v_in) : TARGET
+{
+	float aspect = canvas_size.x / canvas_size.y;
+	float px = 1.0 / canvas_size.y; // one pixel in height units
+	float2 uv = v_in.uv;
+	float2 p = float2(uv.x * aspect, uv.y);
+	float2 frag_px = uv * canvas_size;
+	float h = 1.0 - uv.y;
+
+	float4 acc = float4(0.0, 0.0, 0.0, 0.0);
+
+	if (draw_sky > 0.5) {
+		float3 sky = sky_gradient(h);
+		sky = add_glows(sky, p, px);
+		acc = float4(saturate(sky), 1.0);
+
+		if (star_alpha > 0.0)
+			acc = draw_stars(acc, frag_px, h);
+		acc = draw_shooting_star(acc, p, px);
+		acc = draw_aurora(acc, p);
+		acc = draw_moon(acc, p, px);
+		acc = draw_sun(acc, p, px);
+		acc = draw_rainbow(acc, p);
+		acc = draw_clouds(acc, uv, h, aspect);
+		acc = draw_birds(acc, p, px);
+	}
+
+	acc = draw_bolt(acc, p, px);
+	acc = draw_fog(acc, p, h);
+
+	if (rain_amount > 0.0) {
+		float r = rain_layer(p, 2.0, 0.008, 0.10, 0.45, 1.0, px) * 0.35;
+		r = max(r, rain_layer(p, 1.0, 0.012, 0.15, 0.50, 1.4, px) * 0.5);
+		r = max(r, rain_layer(p, 0.0, 0.018, 0.22, 0.55, 2.0, px) * 0.7);
+		acc = over(acc, rain_color.rgb, r * rain_color.a);
+	}
+
+	if (snow_amount > 0.0) {
+		float s = snow_layer(p, 2.0, 0.04, 1.6, px) * 0.55;
+		s = max(s, snow_layer(p, 1.0, 0.06, 2.6, px) * 0.8);
+		s = max(s, snow_layer(p, 0.0, 0.09, 4.0, px));
+		acc = over(acc, float3(0.97, 0.98, 1.0), s);
+	}
+
+	if (flash > 0.0)
+		acc = over(acc, float3(0.86, 0.89, 1.0), flash * lerp(0.25, 0.45, draw_sky));
+
+	// Final grade.
+	float lum = dot(acc.rgb, float3(0.2126, 0.7152, 0.0722));
+	float3 c = lerp(float3(lum, lum, lum), acc.rgb, grade.x) * grade.y;
+	float3 mono = lum * grade.y * mono_tint.rgb * 1.6;
+	c = lerp(c, mono, grade.z);
+	return float4(saturate(c), acc.a);
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSSkybox(v_in);
+	}
+}

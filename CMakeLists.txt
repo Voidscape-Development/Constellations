@@ -45,6 +45,8 @@ target_sources(
     src/pattern-filter.c
     src/pattern-border.c
     src/shapes-transition.c
+    src/skybox-model.c
+    src/skybox-source.c
     src/svg-image.c
     src/nanosvg-impl.c
 )
