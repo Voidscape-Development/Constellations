@@ -23,10 +23,11 @@ function(set_target_properties_plugin target)
     PROPERTIES VERSION ${PLUGIN_VERSION} SOVERSION ${PLUGIN_VERSION_MAJOR} PREFIX ""
   )
 
+  # OBS Studio 33+ loads system-wide third-party plugins from <libdir>/obs-modules/plugins
   install(
     TARGETS ${target}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/obs-plugins
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/obs-modules/plugins
   )
 
   if(TARGET plugin-support)
@@ -58,8 +59,7 @@ function(target_install_resources target)
     file(GLOB_RECURSE data_files "${CMAKE_CURRENT_SOURCE_DIR}/data/*")
     foreach(data_file IN LISTS data_files)
       cmake_path(
-        RELATIVE_PATH
-        data_file
+        RELATIVE_PATH data_file
         BASE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/data/"
         OUTPUT_VARIABLE relative_path
       )
@@ -70,7 +70,7 @@ function(target_install_resources target)
 
     install(
       DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/data/"
-      DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/obs/obs-plugins/${target}
+      DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/obs/obs-modules/plugins/${target}
       USE_SOURCE_PERMISSIONS
     )
 
@@ -91,7 +91,7 @@ endfunction()
 function(target_add_resource target resource)
   message(DEBUG "Add resource '${resource}' to target ${target} at destination '${target_destination}'...")
 
-  install(FILES "${resource}" DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/obs/obs-plugins/${target})
+  install(FILES "${resource}" DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/obs/obs-modules/plugins/${target})
 
   add_custom_command(
     TARGET ${target}

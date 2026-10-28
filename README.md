@@ -12,13 +12,18 @@ The plugin template is meant to be used as a starting point for OBS Studio plugi
 
 | Platform  | Tool   |
 |-----------|--------|
-| Windows   | Visual Studio 17 2022 |
-| macOS     | XCode 16.0 |
+| Windows   | Visual Studio 18 2026 |
+| macOS     | Xcode 26.5 |
 | Windows, macOS  | CMake 3.30.5 |
-| Ubuntu 24.04 | CMake 3.28.3 |
-| Ubuntu 24.04 | `ninja-build` |
-| Ubuntu 24.04 | `pkg-config`
-| Ubuntu 24.04 | `build-essential` |
+| Ubuntu 26.04 | CMake 3.28.3 |
+| Ubuntu 26.04 | `ninja-build` |
+| Ubuntu 26.04 | `pkg-config`
+| Ubuntu 26.04 | `build-essential` |
+
+Builds target OBS Studio 33 and later. Since OBS Studio 33, third-party plugins on Windows are installed to
+`C:\ProgramData\obs-studio\plugins\<plugin>\<plugin>.dll` with resources in `<plugin>\data` (portable installs use
+`plugins\<plugin>` in the OBS folder), and system-wide Linux packages install to `<libdir>/obs-modules/plugins`. Plugins
+left in the older locations still load in OBS Studio 33 but are marked as legacy and stop loading in OBS Studio 34.
 
 ## Quick Start
 

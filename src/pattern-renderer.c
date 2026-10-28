@@ -69,7 +69,7 @@ static void cpat_item_release_image(struct cpat_item *it)
 		it->image_loaded = false;
 	} else if (it->image_loaded) {
 		obs_enter_graphics();
-		gs_image_file_free(&it->image);
+		gs_image_file_ex_free(&it->image);
 		obs_leave_graphics();
 		it->image_loaded = false;
 	}
@@ -120,9 +120,9 @@ static void cpat_item_acquire_image(struct cpat_item *it)
 		cpat_item_refresh_svg(it);
 		return;
 	}
-	gs_image_file_init(&it->image, it->image_path);
+	gs_image_file_ex_init(&it->image, it->image_path, GS_IMAGE_ALPHA_STRAIGHT);
 	obs_enter_graphics();
-	gs_image_file_init_texture(&it->image);
+	gs_image_file_ex_init_texture(&it->image);
 	obs_leave_graphics();
 	it->image_loaded = it->image.loaded;
 }
