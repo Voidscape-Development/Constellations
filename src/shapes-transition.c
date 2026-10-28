@@ -55,7 +55,7 @@ struct cshape_transition {
 
 	bool add_logo;
 	char *logo_path;
-	gs_image_file_t logo_image;
+	gs_image_file_ex_t logo_image;
 	bool logo_loaded;
 	int logo_display;
 	float logo_slide_angle_deg;
@@ -97,7 +97,7 @@ static void cshape_release_logo(struct cshape_transition *t)
 {
 	if (t->logo_loaded) {
 		obs_enter_graphics();
-		gs_image_file_free(&t->logo_image);
+		gs_image_file_ex_free(&t->logo_image);
 		obs_leave_graphics();
 		t->logo_loaded = false;
 	}
@@ -108,9 +108,9 @@ static void cshape_load_logo(struct cshape_transition *t)
 	cshape_release_logo(t);
 	if (!t->logo_path || !*t->logo_path)
 		return;
-	gs_image_file_init(&t->logo_image, t->logo_path);
+	gs_image_file_ex_init(&t->logo_image, t->logo_path, GS_IMAGE_ALPHA_STRAIGHT);
 	obs_enter_graphics();
-	gs_image_file_init_texture(&t->logo_image);
+	gs_image_file_ex_init_texture(&t->logo_image);
 	obs_leave_graphics();
 	t->logo_loaded = t->logo_image.loaded;
 }

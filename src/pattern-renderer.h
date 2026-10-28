@@ -24,7 +24,7 @@ struct cpat_item {
 	struct vec4 color;
 
 	char *image_path;
-	gs_image_file_t image;
+	gs_image_file_ex_t image;
 	bool image_loaded;
 	int image_color_mode;
 	struct vec4 image_tint;
