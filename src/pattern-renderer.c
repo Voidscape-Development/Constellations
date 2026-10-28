@@ -1212,8 +1212,9 @@ static void set_border_uniforms(struct cpat_renderer *r, uint32_t w, uint32_t h)
 {
 	const struct cpat_border *b = &r->border;
 	set_effect_float(r->effect, "border_active", b->active ? 1.0f : 0.0f);
-	if (!b->active)
-		return;
+	/* Set the rest even when inactive: the shaders only skip them behind a
+	 * runtime branch, so they stay live and D3D11 refuses to draw ("Not all
+	 * shader parameters were set") until every one has a value. */
 	struct vec4 widths, outer, inner;
 	vec4_set(&widths, b->left, b->top, b->right, b->bottom);
 	cpat_border_corner_radii(r, w, h, &outer, &inner);
