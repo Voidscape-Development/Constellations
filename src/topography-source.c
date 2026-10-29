@@ -10,25 +10,57 @@ the Free Software Foundation; either version 2 of the License, or
 
 #include <obs-module.h>
 #include <plugin-support.h>
+#include <util/threading.h>
 #include <math.h>
 
 #include "shape-defs.h"
-
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
+#include "common.h"
+#include "lattice.h"
 
 #define CTOPO_CONTOUR_LEVELS 12.0f
+/* Lattice indices wrap here, matching the shader's periodic hash. */
+#define CTOPO_HASH_PERIOD 4096.0
 
-struct ctopo_source {
-	obs_source_t *self;
-	bool is_filter;
+enum {
+	P_CANVAS_SIZE,
+	P_NOISE_SEED,
+	P_ZOOM_AMOUNT,
+	P_SMOOTHNESS,
+	P_OCT_OFF0,
+	P_OCT_OFF1,
+	P_OCT_OFF2,
+	P_OCT_OFF3,
+	P_OCT_OFF4,
+	P_GRID_OFFSET,
+	P_CONTOUR_LEVELS,
+	P_LINE_HALF_PX,
+	P_LINE_COLOR,
+	P_GLOW_ENABLED,
+	P_GLOW_SIZE_PX,
+	P_GLOW_LEVEL,
+	P_GLOW_COLOR,
+	P_GRID_ENABLED,
+	P_GRID_FOLLOW,
+	P_GRID_SIZE_PX,
+	P_GRID_LINE_HALF_PX,
+	P_GRID_COLOR,
+	P_COUNT,
+};
 
+static const char *const param_names[] = {
+	"canvas_size", "noise_seed",   "zoom_amount",       "smoothness",  "oct_off0",       "oct_off1",
+	"oct_off2",    "oct_off3",     "oct_off4",          "grid_offset", "contour_levels", "line_half_px",
+	"line_color",  "glow_enabled", "glow_size_px",      "glow_level",  "glow_color",     "grid_enabled",
+	"grid_follow", "grid_size_px", "grid_line_half_px", "grid_color",
+};
+_Static_assert(OBS_COUNTOF(param_names) == P_COUNT, "param_names must list every P_ uniform");
+
+struct ctopo_config {
 	uint32_t width, height;
 	int seed;
 
 	float line_size;
-	struct vec4 line_color;
+	struct vec4 line_color; /* sRGB-encoded; the shader mixes in sRGB */
 
 	bool glow;
 	struct vec4 glow_color;
@@ -48,13 +80,27 @@ struct ctopo_source {
 	struct vec4 grid_color;
 	float grid_size;
 	float grid_line_size;
+};
 
-	/* Accumulated map-space slide; integrating each tick means speed and
-	 * angle changes steer the drift instead of teleporting the terrain. */
+struct ctopo_source {
+	obs_source_t *self;
+	bool is_filter;
+	struct cfx_effect fx;
+
+	/* update() runs on the UI thread: it fills `pending`, and tick()
+	 * copies it to `cfg`, so a frame never mixes old and new settings. */
+	pthread_mutex_t mutex;
+	struct ctopo_config pending;
+	bool has_pending;
+	volatile long width, height;
+
+	/* Graphics thread. */
+	struct ctopo_config cfg;
+	/* Accumulated map-space slide in double; integrating each tick means
+	 * speed and angle changes steer the drift instead of teleporting the
+	 * terrain. */
 	double drift_x, drift_y;
-	double elapsed_time;
-
-	gs_effect_t *effect;
+	double pulse_phase; /* cycles, wrapped */
 };
 
 static const char *ctopo_get_name(void *unused)
@@ -72,45 +118,46 @@ static const char *ctopo_filter_get_name(void *unused)
 static void ctopo_update(void *data, obs_data_t *settings)
 {
 	struct ctopo_source *s = data;
-
+	struct ctopo_config c = {0};
 	if (!s->is_filter) {
-		s->width = (uint32_t)obs_data_get_int(settings, "width");
-		s->height = (uint32_t)obs_data_get_int(settings, "height");
-		if (s->width == 0)
-			s->width = 1920;
-		if (s->height == 0)
-			s->height = 1080;
+		c.width = (uint32_t)obs_data_get_int(settings, "width");
+		c.height = (uint32_t)obs_data_get_int(settings, "height");
+		if (c.width == 0)
+			c.width = 1920;
+		if (c.height == 0)
+			c.height = 1080;
 	}
+	c.seed = (int)obs_data_get_int(settings, "seed");
+	c.line_size = (float)obs_data_get_double(settings, "line_size");
+	if (c.line_size < 0.5f)
+		c.line_size = 0.5f;
+	vec4_from_rgba(&c.line_color, (uint32_t)obs_data_get_int(settings, "line_color"));
+	c.glow = obs_data_get_bool(settings, "glow");
+	vec4_from_rgba(&c.glow_color, (uint32_t)obs_data_get_int(settings, "glow_color"));
+	c.glow_size = (float)obs_data_get_double(settings, "glow_size");
+	c.glow_pulse = obs_data_get_bool(settings, "glow_pulse");
+	c.glow_pulse_speed = (float)obs_data_get_double(settings, "glow_pulse_speed");
+	c.drift = obs_data_get_bool(settings, "location_drift");
+	c.drift_speed = (float)obs_data_get_double(settings, "location_drift_speed");
+	c.drift_angle_deg = (float)obs_data_get_double(settings, "location_drift_angle");
+	c.smoothness = (float)obs_data_get_double(settings, "smoothness");
+	c.zoom = (float)obs_data_get_double(settings, "zoom");
+	if (c.zoom < 0.05f)
+		c.zoom = 0.05f;
+	c.grid = obs_data_get_bool(settings, "grid_backdrop");
+	c.grid_follow = obs_data_get_bool(settings, "grid_follow");
+	vec4_from_rgba(&c.grid_color, (uint32_t)obs_data_get_int(settings, "grid_color"));
+	c.grid_size = (float)obs_data_get_double(settings, "grid_size");
+	c.grid_line_size = (float)obs_data_get_double(settings, "grid_line_size");
+	if (c.grid_line_size < 0.5f)
+		c.grid_line_size = 0.5f;
 
-	s->seed = (int)obs_data_get_int(settings, "seed");
-
-	s->line_size = (float)obs_data_get_double(settings, "line_size");
-	if (s->line_size < 0.5f)
-		s->line_size = 0.5f;
-	vec4_from_rgba(&s->line_color, (uint32_t)obs_data_get_int(settings, "line_color"));
-
-	s->glow = obs_data_get_bool(settings, "glow");
-	vec4_from_rgba(&s->glow_color, (uint32_t)obs_data_get_int(settings, "glow_color"));
-	s->glow_size = (float)obs_data_get_double(settings, "glow_size");
-	s->glow_pulse = obs_data_get_bool(settings, "glow_pulse");
-	s->glow_pulse_speed = (float)obs_data_get_double(settings, "glow_pulse_speed");
-
-	s->drift = obs_data_get_bool(settings, "location_drift");
-	s->drift_speed = (float)obs_data_get_double(settings, "location_drift_speed");
-	s->drift_angle_deg = (float)obs_data_get_double(settings, "location_drift_angle");
-
-	s->smoothness = (float)obs_data_get_double(settings, "smoothness");
-	s->zoom = (float)obs_data_get_double(settings, "zoom");
-	if (s->zoom < 0.05f)
-		s->zoom = 0.05f;
-
-	s->grid = obs_data_get_bool(settings, "grid_backdrop");
-	s->grid_follow = obs_data_get_bool(settings, "grid_follow");
-	vec4_from_rgba(&s->grid_color, (uint32_t)obs_data_get_int(settings, "grid_color"));
-	s->grid_size = (float)obs_data_get_double(settings, "grid_size");
-	s->grid_line_size = (float)obs_data_get_double(settings, "grid_line_size");
-	if (s->grid_line_size < 0.5f)
-		s->grid_line_size = 0.5f;
+	os_atomic_set_long(&s->width, (long)c.width);
+	os_atomic_set_long(&s->height, (long)c.height);
+	pthread_mutex_lock(&s->mutex);
+	s->pending = c;
+	s->has_pending = true;
+	pthread_mutex_unlock(&s->mutex);
 }
 
 static void *ctopo_create_common(obs_data_t *settings, obs_source_t *source, bool is_filter)
@@ -118,22 +165,12 @@ static void *ctopo_create_common(obs_data_t *settings, obs_source_t *source, boo
 	struct ctopo_source *s = bzalloc(sizeof(*s));
 	s->self = source;
 	s->is_filter = is_filter;
-
-	char *path = obs_module_file("effects/topography.effect");
-	if (path) {
-		obs_enter_graphics();
-		char *errors = NULL;
-		s->effect = gs_effect_create_from_file(path, &errors);
-		obs_leave_graphics();
-		if (!s->effect)
-			obs_log(LOG_ERROR, "Constellations: failed to compile topography.effect: %s",
-				errors ? errors : "(no detail)");
-		bfree(errors);
-		bfree(path);
-	} else {
-		obs_log(LOG_ERROR, "Constellations: topography.effect not found");
+	pthread_mutex_init_value(&s->mutex);
+	if (pthread_mutex_init(&s->mutex, NULL) != 0) {
+		bfree(s);
+		return NULL;
 	}
-
+	cfx_effect_load(&s->fx, "topography.effect", param_names, P_COUNT);
 	ctopo_update(s, settings);
 	return s;
 }
@@ -151,118 +188,93 @@ static void *ctopo_filter_create(obs_data_t *settings, obs_source_t *source)
 static void ctopo_destroy(void *data)
 {
 	struct ctopo_source *s = data;
-	if (s->effect) {
-		obs_enter_graphics();
-		gs_effect_destroy(s->effect);
-		obs_leave_graphics();
-	}
+	cfx_effect_free(&s->fx);
+	pthread_mutex_destroy(&s->mutex);
 	bfree(s);
 }
 
 static void ctopo_tick(void *data, float seconds)
 {
 	struct ctopo_source *s = data;
-	s->elapsed_time += (double)seconds;
-	if (s->drift && s->drift_speed != 0.0f) {
+	pthread_mutex_lock(&s->mutex);
+	if (s->has_pending) {
+		s->cfg = s->pending;
+		s->has_pending = false;
+	}
+	pthread_mutex_unlock(&s->mutex);
+
+	const struct ctopo_config *c = &s->cfg;
+	if (c->drift && c->drift_speed != 0.0f) {
 		/* Speed is on-screen px/s at zoom 1; one map unit spans 100 px.
 		 * Subtracting makes the terrain slide toward the drift angle. */
-		double ang = (double)s->drift_angle_deg * (M_PI / 180.0);
-		double step = (double)s->drift_speed * (double)seconds / 100.0;
+		double ang = (double)c->drift_angle_deg * (M_PI / 180.0);
+		double step = (double)c->drift_speed * (double)seconds / 100.0;
 		s->drift_x -= cos(ang) * step;
 		s->drift_y -= sin(ang) * step;
 	}
+	if (c->glow_pulse)
+		s->pulse_phase = clat_fmod_pos(s->pulse_phase + (double)c->glow_pulse_speed * seconds, 1.0);
 }
 
 static void ctopo_draw(struct ctopo_source *s, uint32_t width, uint32_t height)
 {
-	if (!s->effect || width == 0 || height == 0)
+	const struct cfx_effect *fx = &s->fx;
+	const struct ctopo_config *c = &s->cfg;
+	if (!fx->effect || width == 0 || height == 0)
 		return;
 
 	float glow_level = 1.0f;
-	if (s->glow_pulse) {
-		float ph = (float)(s->elapsed_time * (double)s->glow_pulse_speed * 2.0 * M_PI);
-		glow_level = 0.15f + 0.85f * (0.5f + 0.5f * sinf(ph));
-	}
+	if (c->glow_pulse)
+		glow_level = 0.15f + 0.85f * (0.5f + 0.5f * sinf((float)(s->pulse_phase * CLAT_TWO_PI)));
 
-	gs_eparam_t *p;
-	struct vec2 v2;
+	cfx_set_vec2(fx, P_CANVAS_SIZE, (float)width, (float)height);
+	cfx_set_float(fx, P_NOISE_SEED, (float)c->seed);
+	cfx_set_float(fx, P_ZOOM_AMOUNT, c->zoom);
+	cfx_set_float(fx, P_SMOOTHNESS, c->smoothness);
 
-	vec2_set(&v2, (float)width, (float)height);
-	p = gs_effect_get_param_by_name(s->effect, "canvas_size");
-	if (p)
-		gs_effect_set_vec2(p, &v2);
-	p = gs_effect_get_param_by_name(s->effect, "noise_seed");
-	if (p)
-		gs_effect_set_float(p, (float)s->seed);
-	p = gs_effect_get_param_by_name(s->effect, "zoom_amount");
-	if (p)
-		gs_effect_set_float(p, s->zoom);
-	p = gs_effect_get_param_by_name(s->effect, "smoothness");
-	if (p)
-		gs_effect_set_float(p, s->smoothness);
-	vec2_set(&v2, (float)s->drift_x, (float)s->drift_y);
-	p = gs_effect_get_param_by_name(s->effect, "drift_offset");
-	if (p)
-		gs_effect_set_vec2(p, &v2);
-	p = gs_effect_get_param_by_name(s->effect, "contour_levels");
-	if (p)
-		gs_effect_set_float(p, CTOPO_CONTOUR_LEVELS);
+	/* Octave k samples the lattice at M^k * map + C_k, with M a
+	 * rotate-and-scale and C_k its accumulated constant shifts. The drift
+	 * part of that offset is computed here in double and handed over as a
+	 * wrapped whole index plus a fraction. */
+	float offs[CLAT_TOPO_OCTAVES][4];
+	clat_topo_octave_offsets(s->drift_x, s->drift_y, CTOPO_HASH_PERIOD, offs);
+	for (int k = 0; k < CLAT_TOPO_OCTAVES; ++k)
+		cfx_set_vec4f(fx, P_OCT_OFF0 + k, offs[k][0], offs[k][1], offs[k][2], offs[k][3]);
+	double gs_world = fmax((double)c->grid_size, 4.0) / 100.0;
+	cfx_set_vec2(fx, P_GRID_OFFSET, (float)clat_fmod_pos(s->drift_x, gs_world),
+		     (float)clat_fmod_pos(s->drift_y, gs_world));
 
-	p = gs_effect_get_param_by_name(s->effect, "line_half_px");
-	if (p)
-		gs_effect_set_float(p, s->line_size * 0.5f);
-	p = gs_effect_get_param_by_name(s->effect, "line_color");
-	if (p)
-		gs_effect_set_vec4(p, &s->line_color);
+	cfx_set_float(fx, P_CONTOUR_LEVELS, CTOPO_CONTOUR_LEVELS);
+	cfx_set_float(fx, P_LINE_HALF_PX, c->line_size * 0.5f);
+	cfx_set_vec4(fx, P_LINE_COLOR, &c->line_color);
+	cfx_set_float(fx, P_GLOW_ENABLED, c->glow ? 1.0f : 0.0f);
+	cfx_set_float(fx, P_GLOW_SIZE_PX, c->glow_size);
+	cfx_set_float(fx, P_GLOW_LEVEL, glow_level);
+	cfx_set_vec4(fx, P_GLOW_COLOR, &c->glow_color);
+	cfx_set_float(fx, P_GRID_ENABLED, c->grid ? 1.0f : 0.0f);
+	cfx_set_float(fx, P_GRID_FOLLOW, c->grid_follow ? 1.0f : 0.0f);
+	cfx_set_float(fx, P_GRID_SIZE_PX, c->grid_size);
+	cfx_set_float(fx, P_GRID_LINE_HALF_PX, c->grid_line_size * 0.5f);
+	cfx_set_vec4(fx, P_GRID_COLOR, &c->grid_color);
 
-	p = gs_effect_get_param_by_name(s->effect, "glow_enabled");
-	if (p)
-		gs_effect_set_float(p, s->glow ? 1.0f : 0.0f);
-	p = gs_effect_get_param_by_name(s->effect, "glow_size_px");
-	if (p)
-		gs_effect_set_float(p, s->glow_size);
-	p = gs_effect_get_param_by_name(s->effect, "glow_level");
-	if (p)
-		gs_effect_set_float(p, glow_level);
-	p = gs_effect_get_param_by_name(s->effect, "glow_color");
-	if (p)
-		gs_effect_set_vec4(p, &s->glow_color);
-
-	p = gs_effect_get_param_by_name(s->effect, "grid_enabled");
-	if (p)
-		gs_effect_set_float(p, s->grid ? 1.0f : 0.0f);
-	p = gs_effect_get_param_by_name(s->effect, "grid_follow");
-	if (p)
-		gs_effect_set_float(p, s->grid_follow ? 1.0f : 0.0f);
-	p = gs_effect_get_param_by_name(s->effect, "grid_size_px");
-	if (p)
-		gs_effect_set_float(p, s->grid_size);
-	p = gs_effect_get_param_by_name(s->effect, "grid_line_half_px");
-	if (p)
-		gs_effect_set_float(p, s->grid_line_size * 0.5f);
-	p = gs_effect_get_param_by_name(s->effect, "grid_color");
-	if (p)
-		gs_effect_set_vec4(p, &s->grid_color);
-
-	gs_blend_state_push();
-	gs_blend_function(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA);
-	while (gs_effect_loop(s->effect, "Draw"))
+	struct cfx_draw_state st;
+	cfx_draw_begin(&st);
+	while (gs_effect_loop(fx->effect, "Draw"))
 		gs_draw_sprite(NULL, 0, width, height);
-	gs_blend_state_pop();
+	cfx_draw_end(&st);
 }
 
 static void ctopo_render(void *data, gs_effect_t *effect)
 {
 	UNUSED_PARAMETER(effect);
 	struct ctopo_source *s = data;
-	ctopo_draw(s, s->width, s->height);
+	ctopo_draw(s, s->cfg.width, s->cfg.height);
 }
 
 static void ctopo_filter_render(void *data, gs_effect_t *effect)
 {
 	UNUSED_PARAMETER(effect);
 	struct ctopo_source *s = data;
-
 	obs_source_t *target = obs_filter_get_target(s->self);
 	uint32_t w = target ? obs_source_get_base_width(target) : 0;
 	uint32_t h = target ? obs_source_get_base_height(target) : 0;
@@ -270,24 +282,31 @@ static void ctopo_filter_render(void *data, gs_effect_t *effect)
 		obs_source_skip_video_filter(s->self);
 		return;
 	}
-
-	if (!obs_source_process_filter_begin(s->self, GS_RGBA, OBS_ALLOW_DIRECT_RENDERING))
+	if (!cfx_filter_begin(s->self, OBS_ALLOW_DIRECT_RENDERING))
 		return;
 	obs_source_process_filter_end(s->self, obs_get_base_effect(OBS_EFFECT_DEFAULT), w, h);
-
 	ctopo_draw(s, w, h);
+}
+
+static enum gs_color_space ctopo_filter_color_space(void *data, size_t count,
+						    const enum gs_color_space *preferred_spaces)
+{
+	UNUSED_PARAMETER(count);
+	UNUSED_PARAMETER(preferred_spaces);
+	struct ctopo_source *s = data;
+	return cfx_filter_color_space(s->self);
 }
 
 static uint32_t ctopo_width(void *data)
 {
 	struct ctopo_source *s = data;
-	return s->width;
+	return (uint32_t)os_atomic_load_long(&s->width);
 }
 
 static uint32_t ctopo_height(void *data)
 {
 	struct ctopo_source *s = data;
-	return s->height;
+	return (uint32_t)os_atomic_load_long(&s->height);
 }
 
 static bool ctopo_glow_modified(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
@@ -295,54 +314,31 @@ static bool ctopo_glow_modified(obs_properties_t *props, obs_property_t *p, obs_
 	UNUSED_PARAMETER(p);
 	bool glow = obs_data_get_bool(settings, "glow");
 	bool pulse = obs_data_get_bool(settings, "glow_pulse");
-	obs_property_t *pp;
-	pp = obs_properties_get(props, "glow_color");
-	if (pp)
-		obs_property_set_visible(pp, glow);
-	pp = obs_properties_get(props, "glow_size");
-	if (pp)
-		obs_property_set_visible(pp, glow);
-	pp = obs_properties_get(props, "glow_pulse");
-	if (pp)
-		obs_property_set_visible(pp, glow);
-	pp = obs_properties_get(props, "glow_pulse_speed");
-	if (pp)
-		obs_property_set_visible(pp, glow && pulse);
-	return true;
+	bool changed = cfx_set_visible(props, "glow_color", glow);
+	changed |= cfx_set_visible(props, "glow_size", glow);
+	changed |= cfx_set_visible(props, "glow_pulse", glow);
+	changed |= cfx_set_visible(props, "glow_pulse_speed", glow && pulse);
+	return changed;
 }
 
 static bool ctopo_drift_modified(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
 {
 	UNUSED_PARAMETER(p);
 	bool drift = obs_data_get_bool(settings, "location_drift");
-	obs_property_t *pp;
-	pp = obs_properties_get(props, "location_drift_speed");
-	if (pp)
-		obs_property_set_visible(pp, drift);
-	pp = obs_properties_get(props, "location_drift_angle");
-	if (pp)
-		obs_property_set_visible(pp, drift);
-	return true;
+	bool changed = cfx_set_visible(props, "location_drift_speed", drift);
+	changed |= cfx_set_visible(props, "location_drift_angle", drift);
+	return changed;
 }
 
 static bool ctopo_grid_modified(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
 {
 	UNUSED_PARAMETER(p);
 	bool grid = obs_data_get_bool(settings, "grid_backdrop");
-	obs_property_t *pp;
-	pp = obs_properties_get(props, "grid_follow");
-	if (pp)
-		obs_property_set_visible(pp, grid);
-	pp = obs_properties_get(props, "grid_color");
-	if (pp)
-		obs_property_set_visible(pp, grid);
-	pp = obs_properties_get(props, "grid_size");
-	if (pp)
-		obs_property_set_visible(pp, grid);
-	pp = obs_properties_get(props, "grid_line_size");
-	if (pp)
-		obs_property_set_visible(pp, grid);
-	return true;
+	bool changed = cfx_set_visible(props, "grid_follow", grid);
+	changed |= cfx_set_visible(props, "grid_color", grid);
+	changed |= cfx_set_visible(props, "grid_size", grid);
+	changed |= cfx_set_visible(props, "grid_line_size", grid);
+	return changed;
 }
 
 static obs_properties_t *ctopo_props_common(bool is_filter)
@@ -473,6 +469,7 @@ static struct obs_source_info ctopo_filter_info = {
 	.update = ctopo_update,
 	.video_tick = ctopo_tick,
 	.video_render = ctopo_filter_render,
+	.video_get_color_space = ctopo_filter_color_space,
 	.get_properties = ctopo_filter_props,
 	.get_defaults = ctopo_defaults_common,
 };

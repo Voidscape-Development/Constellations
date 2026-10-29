@@ -1,77 +1,112 @@
-// Constellations - Tiled SDF pattern effect
+// Constellations - Pattern effect
 // (c) 2026 Eion Dailey - GPLv2+
+//
+// Every shape is its own quad. Draws pass no vertex buffer: the vertex
+// shader turns the vertex id into an instance (a lattice cell, or a place on
+// a Pattern Border row), computes that instance's position, rotation, color
+// and twinkle, and emits a quad around it. The pixel shader evaluates just
+// that one shape, so cost follows the area the shapes cover and any shape
+// size works at any density.
+//
+// Output is linear-light, premultiplied color; the renderer enables the sRGB
+// framebuffer and premultiplied blending around every draw. Colors arrive in
+// linear light except the background gradient's, which are blended in sRGB
+// (the way a gradient tool draws them) and converted here.
+//
+// Scrolling arrives pre-split into wrapped whole cells and px remainders
+// (see src/lattice.c, which mirrors the arithmetic below and is unit
+// tested), so nothing here grows with time.
 
 uniform float4x4 ViewProj;
-
 uniform float2 canvas_size;
-uniform float2 anchor;
+
+// Lattice placement
+uniform float2 origin;          // anchor + item offset, px
+uniform float2 lattice_dir;     // row direction (cos, sin of canvas rotation)
 uniform float cell_size;
-uniform float shape_size;
-uniform float shape_rotation;
-uniform float4 shape_color;
-uniform int shape_kind;
-uniform int polygon_sides;
+uniform float row_first;        // first row drawn, relative to the scroll
+uniform float col_count;        // instances drawn per row
+uniform float along_min;        // start of the visible along-row span, px
+uniform float row_wrap;         // whole rows scrolled, mod 4096
+uniform float perp_frac;        // rest of the cross-row scroll, px
+uniform float col_cells;        // whole cells scrolled along rows, mod 64 * col_period
+uniform float col_frac;         // rest of the along-row scroll, px
+uniform float col_period;       // columns repeat after this many cells
+uniform float alt_lines;        // 1 = odd rows run backwards
+uniform float brick;            // 1 = odd rows sit half a cell along
+uniform float drift_speed_amt;  // per-row speed variation
+uniform float drift_speed_seed;
+
+// Pattern Border perimeter placement: one draw per row
+uniform float border_mode;      // 1 = instances follow the row below
+uniform float4 row_box;         // x0, y0, x1, y1
+uniform float4 row_rad;         // corner radii tl, tr, br, bl
+uniform float4 row_ns;          // shapes on the top, right, bottom, left sides
+uniform float4 row_na;          // shapes on the tr, br, bl, tl corners
+uniform float row_total;
+uniform float row_index;
+uniform float row_phase;        // shapes marched along the row, [0, total)
+uniform float border_align;     // 1 = shapes turn to follow the frame
+uniform float offset_inward;    // px toward the inside of the frame
+uniform float ring_mode;        // 1 = one continuous line along the row path
+
+// Per-instance animation
+uniform float item_seed;
+uniform float wander_amt;       // Location Drift, fraction of a cell
+uniform float wander_time;      // radians, wrapped at 64 * 2 pi
+uniform float twinkle_amount;   // fraction of instances that twinkle
+uniform float twinkle_phase;    // cycles, wrapped at 64
+uniform float auto_rot_active;
+uniform float auto_rot_phase;   // radians of unison spin
+uniform float auto_rot_seed;
+
+// Layout: which item owns a cell
+uniform float layout_mode;      // 0 layered, 1 step-repeat, 2 grid
+uniform float grid_random;
+uniform float step_index;
+uniform float step_count;
+
+// Shape
+uniform float shape_kind;
+uniform float polygon_sides;
 uniform float stroke_thickness;
 uniform float outline_only;
-uniform float image_color_mode; // images: 0 original, 1 tint (multiply), 2 recolor (solid)
-uniform float tex_aspect;       // images: texture width / height (1 = stretch to square)
-
-uniform float color_variation;  // 1 = each cell picks shape_color, color_b or color_c
+uniform float shape_size;
+uniform float shape_rotation;   // radians
+uniform float2 quad_half;       // quad half extents in the shape's frame
+uniform float line_axis;        // 1 = horizontal line, 2 = vertical line
+uniform float4 shape_color;     // linear rgb (shape color or tint), a = opacity
+uniform float color_variation;
 uniform float4 color_b;
 uniform float4 color_c;
+uniform float image_color_mode; // 0 original, 1 tint, 2 recolor
 
-uniform float4 bg_color;
-uniform float4 bg_color2;
-uniform float bg_type;          // 0 solid, 1 radial, 2 linear
-uniform float2 bg_dir;          // linear gradient direction (cos, sin)
-
-uniform float2 lattice_dir;    // canvas rotation axes (cos, sin)
-uniform float2 motion_offset;  // accumulated motion in lattice coords (along, perp) px
-uniform float2 item_offset;    // per-item pattern shift in screen px
-uniform float alt_lines;
-uniform float drift_speed_amt;
-uniform float drift_speed_seed; // shared across items unless per-item drift
-uniform float drift_loc_amt;
-uniform float item_seed;
-uniform float elapsed_time;  // seconds since the source was created
-
-uniform float twinkle_amount; // fraction of cells that twinkle (0 disables)
-uniform float twinkle_speed;  // twinkle cycles per second
-
-uniform float auto_rot_active; // 1 = apply per-cell random rotation angles
-uniform float auto_rot_speed;  // unison spin in radians per second (0 = static)
-uniform float auto_rot_seed;   // reshuffles the random angles
-
-uniform float layout_mode;   // 0 layered, 1 step-repeat, 2 grid
-uniform float grid_random;   // grid mode: 1 = random cell assignment, 0 = ordered
-uniform float step_index;    // this item's slot in step-repeat rotation
-uniform float step_count;    // total enabled items participating in step-repeat
-
+// Masks
 uniform float vignette_enabled;
 uniform float2 vignette_center;
 uniform float vignette_size_px;
 uniform float vignette_direction;
-uniform int vignette_shape;
-uniform int vignette_polygon_sides;
+uniform float vignette_shape;
+uniform float vignette_polygon_sides;
 uniform float vignette_softness;
 uniform float vignette_inverted;
 
-// Pattern Border. The frame spans the whole canvas; its band runs from the
-// outer edge to an inner edge inset by border_widths.
-uniform float border_active;      // 1 = mask everything to the frame band
-uniform float border_clip;        // 1 = shapes clip to the band, 0 = only to the outer edge
-uniform float4 border_widths;     // left, top, right, bottom (px)
-uniform float border_radius;      // outer corner radius (px)
-uniform float4 border_inner_radii; // inner corner radii: tl, tr, br, bl (px)
-uniform float border_softness;    // inner edge fade (px)
-uniform float border_rows;        // perimeter layout: rows across the band
-uniform float border_stagger;     // 1 = odd rows shift by half a spacing
-uniform float border_align;       // 1 = shapes turn to follow their side
-uniform float border_march;       // distance (px) marched clockwise along the frame
+uniform float border_active;
+uniform float border_clip;
+uniform float4 border_widths;      // left, top, right, bottom
+uniform float border_radius;
+uniform float4 border_inner_radii; // tl, tr, br, bl
+uniform float border_softness;
 
-// Pattern Border "Round Source Corners": the source texture and its clip.
+// Background (sRGB-encoded, straight alpha)
+uniform float4 bg_color;
+uniform float4 bg_color2;
+uniform float bg_type;          // 0 solid, 1 radial, 2 linear
+uniform float2 bg_dir;
+
+// Pattern Border "Round Source Corners"
 uniform float2 src_size;
-uniform float4 src_radii;         // tl, tr, br, bl (px)
+uniform float4 src_radii;
 
 uniform texture2d cell_texture;
 uniform texture2d image;
@@ -87,6 +122,13 @@ struct VertData {
 	float2 uv  : TEXCOORD0;
 };
 
+struct InstVert {
+	float4 pos    : POSITION;
+	float2 local  : TEXCOORD0; // px in the shape's own frame
+	float2 screen : TEXCOORD1; // canvas px
+	float4 color  : TEXCOORD2; // linear rgb, a = instance alpha
+};
+
 VertData VSDefault(VertData v_in)
 {
 	VertData v_out;
@@ -94,6 +136,48 @@ VertData VSDefault(VertData v_in)
 	v_out.uv  = v_in.uv;
 	return v_out;
 }
+
+// ---------------------------------------------------------------- helpers
+
+// Floor modulo, exact for integer values below 2^24 even when the
+// division rounds.
+float wrapf(float x, float m)
+{
+	float r = x - floor(x / m) * m;
+	if (r < 0.0)
+		r += m;
+	if (r >= m)
+		r -= m;
+	return r;
+}
+
+// Dave Hoskins' sine-free hash12 (see clat_hash).
+float hash11(float2 p, float seed)
+{
+	p += seed * float2(0.7548777, 0.5698403);
+	float3 p3 = frac(float3(p.x, p.y, p.x) * 0.1031);
+	p3 += dot(p3, float3(p3.y, p3.z, p3.x) + 33.33);
+	return frac((p3.x + p3.y) * p3.z);
+}
+
+float2 hash22(float2 p, float seed)
+{
+	return float2(hash11(p, seed), hash11(p + 17.0, seed + 1.7));
+}
+
+float2 rotate2(float2 p, float a)
+{
+	float c = cos(a);
+	float s = sin(a);
+	return float2(c * p.x - s * p.y, s * p.x + c * p.y);
+}
+
+float srgb_to_linear(float c)
+{
+	return (c <= 0.04045) ? (c / 12.92) : pow((c + 0.055) / 1.055, 2.4);
+}
+
+// ---------------------------------------------------------------- shapes
 
 float sd_circle(float2 p, float r)
 {
@@ -113,11 +197,9 @@ float sd_cross(float2 p, float arm_len, float arm_thick)
 	return min(h, v);
 }
 
-float sd_polygon(float2 p, float r, int n)
+float sd_polygon(float2 p, float r, float n)
 {
-	int sides = n;
-	if (sides < 3) sides = 3;
-	float fn = float(sides);
+	float fn = max(floor(n + 0.5), 3.0);
 	float ang = atan2(p.x, p.y);
 	float sector = 6.2831853 / fn;
 	float idx = floor(ang / sector + 0.5);
@@ -128,20 +210,16 @@ float sd_polygon(float2 p, float r, int n)
 	return pr.y - r * cos(sector * 0.5);
 }
 
-// Polygon re-centered on its bounding box. sd_polygon centers the shape on
-// its circumcenter, but odd side counts are vertically asymmetric (the top
-// vertex reaches r while the flat bottom edge stops at the apothem), which
-// leaves triangles and pentagons sitting high in their cell compared to
-// circles and squares. Even side counts are symmetric and need no offset.
-float sd_polygon_centered(float2 p, float r, int n)
+// Odd side counts are vertically asymmetric around the circumcenter (the
+// top vertex reaches r, the flat bottom edge only the apothem), so they are
+// re-centered on their bounding box to sit level with the other shapes.
+float sd_polygon_centered(float2 p, float r, float n)
 {
-	int sides = n;
-	if (sides < 3) sides = 3;
-	float fn = float(sides);
+	float fn = max(floor(n + 0.5), 3.0);
 	float yc = 0.0;
 	if (frac(fn * 0.5) > 0.25)
 		yc = (r * cos(3.14159265 / fn) - r) * 0.5;
-	return sd_polygon(float2(p.x, p.y + yc), r, sides);
+	return sd_polygon(float2(p.x, p.y + yc), r, fn);
 }
 
 float sd_squircle(float2 p, float r)
@@ -153,10 +231,10 @@ float sd_squircle(float2 p, float r)
 	return k - r;
 }
 
+// Exact 5-point star, tip up (y is flipped for screen space). The inner
+// vertices sit at 0.45 of the outer radius.
 float sd_star5(float2 p, float r)
 {
-	// Exact 5-point star, tip up (y is flipped for screen space). The inner
-	// vertices sit at 0.45 of the outer radius.
 	float2 k1 = float2(0.809016994, -0.587785252);
 	float2 k2 = float2(-k1.x, k1.y);
 	float rf = 0.45;
@@ -175,10 +253,10 @@ float dot2(float2 v)
 	return dot(v, v);
 }
 
+// iq's unit heart spans y in [0..1] with the tip at the origin; y is flipped
+// for screen space and shifted so the shape is centered.
 float sd_heart(float2 p, float sz)
 {
-	// iq's unit heart spans y in [0..1] with the tip at the origin; flip y
-	// for screen space and shift so the shape is centered on the cell.
 	float s = max(sz, 1.0e-4) * 0.85;
 	float2 q = float2(abs(p.x), -p.y) / s + float2(0.0, 0.5);
 	float d;
@@ -189,195 +267,46 @@ float sd_heart(float2 p, float sz)
 	return d * s;
 }
 
-float hash11(float2 p, float seed)
-{
-	return frac(sin(dot(p + seed, float2(127.1, 311.7))) * 43758.5453);
-}
-
-float2 hash22(float2 p, float seed)
-{
-	return float2(hash11(p, seed), hash11(p + 17.0, seed + 1.7));
-}
-
-float vignette_mask_calc(float2 px)
-{
-	if (vignette_enabled < 0.5) return 1.0;
-	float2 d = px - vignette_center;
-	float r = max(vignette_size_px, 1.0);
-	float v = 0.0;
-	if (vignette_shape == 0) {
-		v = length(d) / r;
-	} else if (vignette_shape == 1) {
-		float2 dir = float2(cos(vignette_direction), sin(vignette_direction));
-		v = (dot(d, dir) / r) * 0.5 + 0.5;
-	} else if (vignette_shape == 2) {
-		float ca = cos(-vignette_direction);
-		float sa = sin(-vignette_direction);
-		float2 rd = float2(ca * d.x - sa * d.y, sa * d.x + ca * d.y);
-		v = max(abs(rd.x), abs(rd.y)) / r;
-	} else {
-		float ca = cos(-vignette_direction);
-		float sa = sin(-vignette_direction);
-		float2 rd = float2(ca * d.x - sa * d.y, sa * d.x + ca * d.y);
-		float sd = sd_polygon(rd, r, vignette_polygon_sides);
-		v = sd / r + 1.0;
-	}
-	float soft = max(vignette_softness, 0.001);
-	float a = 1.0 - smoothstep(1.0 - soft, 1.0, v);
-	if (vignette_inverted > 0.5) a = 1.0 - a;
-	return saturate(a);
-}
-
-float2 cell_local_at(float2 frag_px, int dcol, int drow, out float2 cell_id)
-{
-	float cs = max(cell_size, 1.0);
-	float2 pos = frag_px - anchor - item_offset;
-	float2 axis = lattice_dir;
-	float2 perp = float2(-axis.y, axis.x);
-
-	// Decompose the fragment onto the (rotated) lattice axes. The motion
-	// offset is already accumulated in lattice coordinates, so the scroll
-	// rotates with the lattice around the anchor. Its perpendicular part
-	// scrolls whole rows; the along-row part is what alternating lines and
-	// speed drift modulate.
-	float m_along = dot(pos, axis);
-	float m_perp  = dot(pos, perp) - motion_offset.y;
-
-	// Round-to-nearest so cell (0,0) is centered on the anchor.
-	float row = floor(m_perp / cs + 0.5) + float(drow);
-	float col_shift = motion_offset.x;
-	if (alt_lines > 0.5 && frac(row * 0.5) > 0.25)
-		col_shift = -col_shift;
-	if (drift_speed_amt > 0.0) {
-		float s = (hash11(float2(row, 7.0), drift_speed_seed) - 0.5) * 2.0 * drift_speed_amt;
-		col_shift *= (1.0 + s);
-	}
-	float brick_shift = 0.0;
-	if (layout_mode > 0.5 && layout_mode < 1.5 && frac(row * 0.5) > 0.25)
-		brick_shift = cs * 0.5;
-	float m_along_shifted = m_along - col_shift - brick_shift;
-	float col = floor(m_along_shifted / cs + 0.5) + float(dcol);
-
-	float la = m_along_shifted - col * cs;
-	float lp = m_perp - row * cs;
-
-	if (drift_loc_amt > 0.0) {
-		// Animated wander: each cell's shape roams around the cell center
-		// as the sum of two counter-rotating circles, each with its own
-		// random phase and rate. Independent per-axis sines would trace a
-		// square Lissajous that lingers in its corners, so shapes favored
-		// the diagonals and reached ~1.4x farther along them; this path
-		// stays inside a disc of radius drift_loc_amt * cell and spends
-		// equal time in every direction.
-		float2 ph = hash22(float2(col, row) + 0.5, item_seed) * 6.2831853;
-		float2 rate = hash22(float2(col, row) + 17.9, item_seed + 4.7) + 0.5;
-		float amp = drift_loc_amt * cs * 0.5;
-		float a1 = elapsed_time * rate.x + ph.x;
-		float a2 = ph.y - elapsed_time * rate.y;
-		la -= (cos(a1) + cos(a2)) * amp;
-		lp -= (sin(a1) + sin(a2)) * amp;
-	}
-
-	cell_id = float2(col, row);
-	return float2(la, lp);
-}
-
-bool cell_belongs_to_this_item(float2 cell_id)
-{
-	if (layout_mode < 0.5)
-		return true;
-	float n = max(step_count, 1.0);
-	if (layout_mode > 1.5 && grid_random > 0.5) {
-		// Random grid: each cell picks a pseudo-random item. The hash seed
-		// is a constant shared by every item's pass, so all passes agree
-		// and exactly one item claims each cell.
-		float pick = floor(hash11(cell_id + 0.5, 31.7) * n);
-		if (pick > n - 1.0)
-			pick = n - 1.0;
-		return abs(pick - step_index) < 0.5;
-	}
-	// Step-and-repeat and ordered grid: items cycle by column.
-	float raw = cell_id.x;
-	float rem = raw - floor(raw / n) * n;
-	return abs(rem - step_index) < 0.5;
-}
-
-// Number of neighbor cells (in each direction) whose shape can reach the
-// current fragment. Without this, large shapes get clipped at cell borders
-// and form a visible grid; with it we evaluate every contributing instance.
-int tile_reach()
-{
-	float cs = max(cell_size, 1.0);
-	// 0.71 covers the diagonal extent of squares/crosses. The outline stroke
-	// is centered on the shape edge, so half of it hangs outside the fill.
-	float extent = shape_size * 0.71;
-	if (outline_only > 0.5)
-		extent += stroke_thickness * shape_size * 0.5;
-	extent += drift_loc_amt * cs;
-	float r = ceil(extent / cs - 0.5);
-	if (r < 0.0) r = 0.0;
-	if (r > 8.0) r = 8.0;
-	return int(r);
-}
-
-float2 rotate2(float2 p, float a)
-{
-	float c = cos(a);
-	float s = sin(a);
-	return float2(c * p.x - s * p.y, s * p.x + c * p.y);
-}
-
-// Per-cell fade for the Twinkle effect. twinkle_amount selects which cells
-// participate; participants fade in and out on their own random phase and
-// rate, twinkle_speed cycles per second on average.
-float twinkle_alpha_calc(float2 cell_id)
-{
-	float sel = hash11(cell_id + 3.7, item_seed + 5.13);
-	if (sel > twinkle_amount)
-		return 1.0;
-	float ph = hash11(cell_id + 11.9, item_seed + 7.77) * 6.2831853;
-	float rate = 0.75 + 0.5 * hash11(cell_id + 27.3, item_seed + 2.19);
-	return sin(elapsed_time * twinkle_speed * 6.2831853 * rate + ph) * 0.5 + 0.5;
-}
-
-// Per-cell color for Random Color Per Cell. Only the rgb varies; alpha
-// (shape opacity) always comes from shape_color.
-float3 cell_rgb(float2 cell_id)
-{
-	if (color_variation < 0.5)
-		return shape_color.rgb;
-	float pick = floor(hash11(cell_id + 53.1, item_seed + 9.37) * 3.0);
-	if (pick < 0.5)
-		return shape_color.rgb;
-	if (pick < 1.5)
-		return color_b.rgb;
-	return color_c.rgb;
-}
-
-// Per-cell rotation for the Auto Rotation effect, added on top of the item's
-// static rotation. Every cell always gets its own random angle (reshuffled by
-// the seed); Unison style additionally spins all cells together at the shared
-// speed, while Random style leaves them static (speed arrives as 0).
-float auto_rot_angle(float2 cell_id)
-{
-	if (auto_rot_active < 0.5)
-		return 0.0;
-	float ph = hash11(cell_id + 41.3, auto_rot_seed + item_seed + 6.29) * 6.2831853;
-	return ph + elapsed_time * auto_rot_speed;
-}
-
 float shape_sdf(float2 p)
 {
 	float r = shape_size * 0.5;
-	if (shape_kind == 0) return sd_circle(p, r);
-	if (shape_kind == 1) return sd_cross(p, r, max(stroke_thickness, 0.05) * shape_size * 0.5);
-	if (shape_kind == 2) return sd_box(p, float2(r, r));
-	if (shape_kind == 3) return sd_polygon_centered(p, r, polygon_sides);
-	if (shape_kind == 4) return sd_squircle(p, r);
-	if (shape_kind == 5) return abs(p.y) - r;
-	if (shape_kind == 7) return sd_star5(p, r);
-	if (shape_kind == 8) return sd_heart(p, shape_size);
-	return abs(p.x) - r;
+	if (shape_kind < 0.5) return sd_circle(p, r);
+	if (shape_kind < 1.5) return sd_cross(p, r, max(stroke_thickness, 0.05) * shape_size * 0.5);
+	if (shape_kind < 2.5) return sd_box(p, float2(r, r));
+	if (shape_kind < 3.5) return sd_polygon_centered(p, r, polygon_sides);
+	if (shape_kind < 4.5) return sd_squircle(p, r);
+	if (shape_kind < 5.5) return abs(p.y) - r;
+	if (shape_kind < 6.5) return abs(p.x) - r;
+	if (shape_kind < 7.5) return sd_star5(p, r);
+	return sd_heart(p, shape_size);
+}
+
+// ----------------------------------------------------------------- masks
+
+float vignette_mask(float2 px)
+{
+	if (vignette_enabled < 0.5)
+		return 1.0;
+	float2 d = px - vignette_center;
+	float r = max(vignette_size_px, 1.0);
+	float v;
+	if (vignette_shape < 0.5) {
+		v = length(d) / r;
+	} else if (vignette_shape < 1.5) {
+		float2 dir = float2(cos(vignette_direction), sin(vignette_direction));
+		v = (dot(d, dir) / r) * 0.5 + 0.5;
+	} else {
+		float2 rd = rotate2(d, -vignette_direction);
+		if (vignette_shape < 2.5)
+			v = max(abs(rd.x), abs(rd.y)) / r;
+		else
+			v = sd_polygon(rd, r, vignette_polygon_sides) / r + 1.0;
+	}
+	float soft = max(vignette_softness, 0.001);
+	float a = 1.0 - smoothstep(1.0 - soft, 1.0, v);
+	if (vignette_inverted > 0.5)
+		a = 1.0 - a;
+	return saturate(a);
 }
 
 // Rounded box with its own radius per corner (tl, tr, br, bl), y down.
@@ -430,58 +359,74 @@ float border_shape_mask(float2 px)
 	return 1.0 - smoothstep(-0.5, 0.5, border_outer_sd(px));
 }
 
-// One row of the perimeter layout: a rounded rectangle path walked clockwise
-// from the top-left corner as eight segments (top side, top-right corner,
-// right side, bottom-right corner, bottom side, bottom-left corner, left
-// side, top-left corner). Each segment holds a whole number of shapes, so
-// shapes sit evenly on every side and a shape lands on each sharp corner.
-// The path parameter u counts shapes: segment k spans u0_k .. u0_k + n_k.
-struct BorderRow {
-	float4 box;  // x0, y0, x1, y1
-	float4 rad;  // corner radii tl, tr, br, bl
-	float4 ns;   // shapes on the top, right, bottom, left sides
-	float4 na;   // shapes on the tr, br, bl, tl corners
-	float total; // shapes in the whole row
-};
-
-// Row at fraction f (0 = outer edge, 1 = inner edge) across the band, with
-// shapes spaced about cs px apart.
-BorderRow border_make_row(float f, float cs)
+float masks(float2 px)
 {
-	BorderRow br;
-	float x0 = f * border_widths.x;
-	float y0 = f * border_widths.y;
-	float x1 = canvas_size.x - f * border_widths.z;
-	float y1 = canvas_size.y - f * border_widths.w;
-	if (x1 < x0) {
-		x0 = (x0 + x1) * 0.5;
-		x1 = x0;
-	}
-	if (y1 < y0) {
-		y0 = (y0 + y1) * 0.5;
-		y1 = y0;
-	}
-	float lim = min(x1 - x0, y1 - y0) * 0.5;
-	float rc = border_radius;
-	br.box = float4(x0, y0, x1, y1);
-	br.rad = min(lerp(float4(rc, rc, rc, rc), border_inner_radii, f), lim);
-	float4 ls = max(float4(x1 - x0 - br.rad.x - br.rad.y, y1 - y0 - br.rad.y - br.rad.z,
-			       x1 - x0 - br.rad.z - br.rad.w, y1 - y0 - br.rad.w - br.rad.x), 0.0);
-	float4 la = float4(br.rad.y, br.rad.z, br.rad.w, br.rad.x) * 1.5707963;
-	br.ns = max(floor(ls / cs + 0.5), 1.0) * step(0.5, ls);
-	br.na = floor(la / cs + 0.5);
-	br.total = dot(br.ns, float4(1.0, 1.0, 1.0, 1.0)) + dot(br.na, float4(1.0, 1.0, 1.0, 1.0));
-	return br;
+	return vignette_mask(px) * border_shape_mask(px);
 }
 
-float border_wrap(float u, float n)
+// ------------------------------------------------------------- placement
+
+// Whether this item draws the cell; in Step and Repeat and Grid layouts
+// every cell belongs to exactly one item.
+bool owns_cell(float2 cid)
 {
-	return u - floor(u / n) * n;
+	if (layout_mode < 0.5)
+		return true;
+	float n = max(step_count, 1.0);
+	if (layout_mode > 1.5 && grid_random > 0.5) {
+		// The seed is shared by every item's pass, so all passes agree.
+		float pick = min(floor(hash11(cid + 0.5, 31.7) * n), n - 1.0);
+		return abs(pick - step_index) < 0.5;
+	}
+	return abs(wrapf(cid.x, n) - step_index) < 0.5;
 }
 
-// Heading along a side at v shapes into it. Next to a sharp corner the
-// heading turns over the half spacing on either side of it, so the corner
-// shape points diagonally and moving shapes swing around the corner.
+// Two counter-rotating circles per instance, each with its own phase and
+// rate: the path stays inside a disc and favors no direction. Rates are
+// quantized to 1/64 so wander_time can wrap at 64 * 2 pi without a jump.
+float2 wander_offset(float2 cid, float cs)
+{
+	if (wander_amt <= 0.0)
+		return float2(0.0, 0.0);
+	float2 ph = hash22(cid + 0.5, item_seed) * 6.2831853;
+	float2 rate = (32.0 + floor(hash22(cid + 17.9, item_seed + 4.7) * 65.0)) / 64.0;
+	float a1 = wander_time * rate.x + ph.x;
+	float a2 = ph.y - wander_time * rate.y;
+	return float2(cos(a1) + cos(a2), sin(a1) + sin(a2)) * (wander_amt * cs * 0.5);
+}
+
+float twinkle_alpha(float2 cid)
+{
+	if (twinkle_amount <= 0.001)
+		return 1.0;
+	if (hash11(cid + 3.7, item_seed + 5.13) > twinkle_amount)
+		return 1.0;
+	float ph = hash11(cid + 11.9, item_seed + 7.77) * 6.2831853;
+	float rate = (48.0 + floor(hash11(cid + 27.3, item_seed + 2.19) * 33.0)) / 64.0;
+	return sin(twinkle_phase * rate * 6.2831853 + ph) * 0.5 + 0.5;
+}
+
+float3 cell_rgb(float2 cid)
+{
+	if (color_variation < 0.5)
+		return shape_color.rgb;
+	float pick = floor(hash11(cid + 53.1, item_seed + 9.37) * 3.0);
+	if (pick < 0.5)
+		return shape_color.rgb;
+	if (pick < 1.5)
+		return color_b.rgb;
+	return color_c.rgb;
+}
+
+float auto_rot_angle(float2 cid)
+{
+	if (auto_rot_active < 0.5)
+		return 0.0;
+	return hash11(cid + 41.3, auto_rot_seed + item_seed + 6.29) * 6.2831853 + auto_rot_phase;
+}
+
+// Turn toward the next side over the half spacing either side of a sharp
+// corner, so the corner shape points diagonally.
 float border_side_angle(float base, float v, float n, float r_prev, float r_next)
 {
 	float a = base;
@@ -492,431 +437,209 @@ float border_side_angle(float base, float v, float n, float r_prev, float r_next
 	return a;
 }
 
-// Point at path parameter u (0 <= u < total), and its clockwise heading.
-float2 border_row_point(BorderRow br, float u, out float ang)
+// Point at path parameter u on the current border row, its clockwise
+// heading, and the spacing of the shapes on that segment (mirrors
+// clat_border_point).
+float2 border_point(float u, out float ang, out float spacing)
 {
-	float x0 = br.box.x;
-	float y0 = br.box.y;
-	float x1 = br.box.z;
-	float y1 = br.box.w;
-	float4 r = br.rad;
+	float x0 = row_box.x;
+	float y0 = row_box.y;
+	float x1 = row_box.z;
+	float y1 = row_box.w;
+	float4 r = row_rad;
 	float u0 = 0.0;
 	ang = 0.0;
+	spacing = cell_size;
 
-	if (u < u0 + br.ns.x) {
+	if (u < u0 + row_ns.x) {
 		float v = u - u0;
-		ang = border_side_angle(0.0, v, br.ns.x, r.x, r.y);
-		return lerp(float2(x0 + r.x, y0), float2(x1 - r.y, y0), v / br.ns.x);
+		ang = border_side_angle(0.0, v, row_ns.x, r.x, r.y);
+		spacing = (x1 - x0 - r.x - r.y) / row_ns.x;
+		return lerp(float2(x0 + r.x, y0), float2(x1 - r.y, y0), v / row_ns.x);
 	}
-	u0 += br.ns.x;
-	if (u < u0 + br.na.x) {
-		float a = -1.5707963 + (u - u0) / br.na.x * 1.5707963;
+	u0 += row_ns.x;
+	if (u < u0 + row_na.x) {
+		float a = -1.5707963 + (u - u0) / row_na.x * 1.5707963;
 		ang = a + 1.5707963;
+		spacing = r.y * 1.5707963 / row_na.x;
 		return float2(x1 - r.y, y0 + r.y) + r.y * float2(cos(a), sin(a));
 	}
-	u0 += br.na.x;
-	if (u < u0 + br.ns.y) {
+	u0 += row_na.x;
+	if (u < u0 + row_ns.y) {
 		float v = u - u0;
-		ang = border_side_angle(1.5707963, v, br.ns.y, r.y, r.z);
-		return lerp(float2(x1, y0 + r.y), float2(x1, y1 - r.z), v / br.ns.y);
+		ang = border_side_angle(1.5707963, v, row_ns.y, r.y, r.z);
+		spacing = (y1 - y0 - r.y - r.z) / row_ns.y;
+		return lerp(float2(x1, y0 + r.y), float2(x1, y1 - r.z), v / row_ns.y);
 	}
-	u0 += br.ns.y;
-	if (u < u0 + br.na.y) {
-		float a = (u - u0) / br.na.y * 1.5707963;
+	u0 += row_ns.y;
+	if (u < u0 + row_na.y) {
+		float a = (u - u0) / row_na.y * 1.5707963;
 		ang = a + 1.5707963;
+		spacing = r.z * 1.5707963 / row_na.y;
 		return float2(x1 - r.z, y1 - r.z) + r.z * float2(cos(a), sin(a));
 	}
-	u0 += br.na.y;
-	if (u < u0 + br.ns.z) {
+	u0 += row_na.y;
+	if (u < u0 + row_ns.z) {
 		float v = u - u0;
-		ang = border_side_angle(3.1415927, v, br.ns.z, r.z, r.w);
-		return lerp(float2(x1 - r.z, y1), float2(x0 + r.w, y1), v / br.ns.z);
+		ang = border_side_angle(3.1415927, v, row_ns.z, r.z, r.w);
+		spacing = (x1 - x0 - r.z - r.w) / row_ns.z;
+		return lerp(float2(x1 - r.z, y1), float2(x0 + r.w, y1), v / row_ns.z);
 	}
-	u0 += br.ns.z;
-	if (u < u0 + br.na.z) {
-		float a = 1.5707963 + (u - u0) / br.na.z * 1.5707963;
+	u0 += row_ns.z;
+	if (u < u0 + row_na.z) {
+		float a = 1.5707963 + (u - u0) / row_na.z * 1.5707963;
 		ang = a + 1.5707963;
+		spacing = r.w * 1.5707963 / row_na.z;
 		return float2(x0 + r.w, y1 - r.w) + r.w * float2(cos(a), sin(a));
 	}
-	u0 += br.na.z;
-	if (u < u0 + br.ns.w) {
+	u0 += row_na.z;
+	if (u < u0 + row_ns.w) {
 		float v = u - u0;
-		ang = border_side_angle(4.7123890, v, br.ns.w, r.w, r.x);
-		return lerp(float2(x0, y1 - r.w), float2(x0, y0 + r.x), v / br.ns.w);
+		ang = border_side_angle(4.7123890, v, row_ns.w, r.w, r.x);
+		spacing = (y1 - y0 - r.w - r.x) / row_ns.w;
+		return lerp(float2(x0, y1 - r.w), float2(x0, y0 + r.x), v / row_ns.w);
 	}
-	u0 += br.ns.w;
-	float a = 3.1415927 + (u - u0) / max(br.na.w, 1.0) * 1.5707963;
+	u0 += row_ns.w;
+	float na = max(row_na.w, 1.0);
+	float a = 3.1415927 + (u - u0) / na * 1.5707963;
 	ang = a + 1.5707963;
+	spacing = r.x * 1.5707963 / na;
 	return float2(x0 + r.x, y0 + r.x) + r.x * float2(cos(a), sin(a));
 }
 
-void border_project_line(float2 px, float2 a, float2 b, float u0, float n, inout float best_d, inout float best_u)
+InstVert VSInstance(uint id : VERTEXID)
 {
-	float2 d = b - a;
-	float l2 = dot(d, d);
-	float t = 0.0;
-	if (l2 > 1.0e-6)
-		t = saturate(dot(px - a, d) / l2);
-	float dist = length(px - (a + d * t));
-	if (dist < best_d) {
-		best_d = dist;
-		best_u = u0 + t * n;
-	}
-}
+	InstVert v_out;
 
-void border_project_arc(float2 px, float2 c, float r, float a_start, float u0, float n, inout float best_d,
-			inout float best_u)
-{
-	float2 q = px - c;
-	float t = 0.5;
-	if (r > 0.01) {
-		float2 rq = rotate2(q, -(a_start + 0.78539816));
-		t = clamp(atan2(rq.y, rq.x), -0.78539816, 0.78539816) / 1.5707963 + 0.5;
+	// Six vertices per instance: triangles (0, 1, 2) and (2, 1, 3) of the
+	// quad's corners.
+	float fid = float(id);
+	float q = floor(fid / 6.0);
+	float k = fid - q * 6.0;
+	if (k < 0.0) {
+		q -= 1.0;
+		k += 6.0;
+	} else if (k >= 6.0) {
+		q += 1.0;
+		k -= 6.0;
 	}
-	float a = a_start + t * 1.5707963;
-	float dist = length(q - r * float2(cos(a), sin(a)));
-	if (dist < best_d) {
-		best_d = dist;
-		best_u = u0 + t * n;
-	}
-}
+	float vi = (k < 2.5) ? k : ((k < 3.5) ? 2.0 : ((k < 4.5) ? 1.0 : 3.0));
+	float2 corner = float2(wrapf(vi, 2.0) * 2.0 - 1.0, floor(vi * 0.5 + 0.25) * 2.0 - 1.0);
 
-// Path parameter of the point on the row nearest to px, and its distance.
-float border_row_project(BorderRow br, float2 px, out float dist)
-{
-	float x0 = br.box.x;
-	float y0 = br.box.y;
-	float x1 = br.box.z;
-	float y1 = br.box.w;
-	float4 r = br.rad;
-	float best_d = 1.0e9;
-	float best_u = 0.0;
-	float u0 = 0.0;
-	border_project_line(px, float2(x0 + r.x, y0), float2(x1 - r.y, y0), u0, br.ns.x, best_d, best_u);
-	u0 += br.ns.x;
-	border_project_arc(px, float2(x1 - r.y, y0 + r.y), r.y, -1.5707963, u0, br.na.x, best_d, best_u);
-	u0 += br.na.x;
-	border_project_line(px, float2(x1, y0 + r.y), float2(x1, y1 - r.z), u0, br.ns.y, best_d, best_u);
-	u0 += br.ns.y;
-	border_project_arc(px, float2(x1 - r.z, y1 - r.z), r.z, 0.0, u0, br.na.y, best_d, best_u);
-	u0 += br.na.y;
-	border_project_line(px, float2(x1 - r.z, y1), float2(x0 + r.w, y1), u0, br.ns.z, best_d, best_u);
-	u0 += br.ns.z;
-	border_project_arc(px, float2(x0 + r.w, y1 - r.w), r.w, 1.5707963, u0, br.na.z, best_d, best_u);
-	u0 += br.na.z;
-	border_project_line(px, float2(x0, y1 - r.w), float2(x0, y0 + r.x), u0, br.ns.w, best_d, best_u);
-	u0 += br.ns.w;
-	border_project_arc(px, float2(x0 + r.x, y0 + r.x), r.x, 3.1415927, u0, br.na.w, best_d, best_u);
-	dist = best_d;
-	return best_u;
-}
-
-// Shapes marched along a row so far, in shape spacings. Alternating Line
-// Motion reverses odd rows and Speed Drift varies the pace per row, as they
-// do for lattice rows; staggered rows sit half a spacing along.
-float border_row_phase(float row, float cs)
-{
-	float m = border_march;
-	if (alt_lines > 0.5 && frac(row * 0.5) > 0.25)
-		m = -m;
-	if (drift_speed_amt > 0.0) {
-		float s = (hash11(float2(row, 7.0), drift_speed_seed) - 0.5) * 2.0 * drift_speed_amt;
-		m *= (1.0 + s);
-	}
-	float ph = (m + item_offset.x) / cs;
-	if (border_stagger > 0.5 && frac(row * 0.5) > 0.25)
-		ph += 0.5;
-	return ph;
-}
-
-// Fragment position in the frame of the shape centered at pos with heading
-// ang: item_offset.y moves the shape toward the inside of the frame, and
-// with Align to Edge the shape turns so its top faces outward.
-float2 border_local(float2 frag_px, float2 pos, float ang, float2 cid, float cs)
-{
-	float2 tng = float2(cos(ang), sin(ang));
-	float2 c = pos + float2(-tng.y, tng.x) * item_offset.y;
-	if (drift_loc_amt > 0.0) {
-		// Same two-circle wander as the lattice (see cell_local_at).
-		float2 ph = hash22(cid + 0.5, item_seed) * 6.2831853;
-		float2 rate = hash22(cid + 17.9, item_seed + 4.7) + 0.5;
-		float amp = drift_loc_amt * cs * 0.5;
-		float a1 = elapsed_time * rate.x + ph.x;
-		float a2 = ph.y - elapsed_time * rate.y;
-		c += float2(cos(a1) + cos(a2), sin(a1) + sin(a2)) * amp;
-	}
-	float2 v = frag_px - c;
-	if (border_align > 0.5)
-		v = rotate2(v, -ang);
-	return v;
-}
-
-// How far (px) a shape reaches from its center, and how many neighbors on
-// each side along a row can reach a fragment.
-float border_extent()
-{
 	float cs = max(cell_size, 1.0);
-	float extent = shape_size * 0.71;
-	if (outline_only > 0.5)
-		extent += stroke_thickness * shape_size * 0.5;
-	return extent + drift_loc_amt * cs + abs(item_offset.y);
-}
+	float2 cid;
+	float2 center;
+	float heading = 0.0;
+	float spacing = cs;
+	bool valid = true;
 
-int border_reach(float extent)
-{
-	// Rounding each segment to whole shapes can tighten the spacing to
-	// two thirds of the cell size.
-	float cs = max(cell_size, 1.0);
-	return int(clamp(ceil(extent / (cs * 0.66)) + 1.0, 1.0, 8.0));
-}
-
-float4 PSBorderShape(VertData v_in) : TARGET
-{
-	float2 frag_px = v_in.uv * canvas_size;
-	float mask = border_shape_mask(frag_px);
-	if (mask <= 0.0)
-		return float4(0.0, 0.0, 0.0, 0.0);
-	float cs = max(cell_size, 1.0);
-	float extent = border_extent();
-	int reach = border_reach(extent);
-	int rows = int(clamp(border_rows, 1.0, 8.0));
-	float stroke_w = max(stroke_thickness, 0.001) * shape_size;
-	float alpha = 0.0;
-	float best_a = -1.0;
-	float2 color_cid = float2(0.0, 0.0);
-	for (int j = 0; j < rows; ++j) {
-		BorderRow br = border_make_row((float(j) + 0.5) / float(rows), cs);
-		if (br.total < 0.5)
-			continue;
-		float pd;
-		float pu = border_row_project(br, frag_px, pd);
-		if (pd > extent + 2.0)
-			continue;
-		float phase = border_row_phase(float(j), cs);
-		float base = floor(pu - phase + 0.5);
-		for (int d = -reach; d <= reach; ++d) {
-			float k = base + float(d);
-			float2 cid = float2(border_wrap(k, br.total), float(j));
-			if (!cell_belongs_to_this_item(cid))
-				continue;
-			float ang;
-			float2 pos = border_row_point(br, border_wrap(k + phase, br.total), ang);
-			float2 p = border_local(frag_px, pos, ang, cid, cs);
-			p = rotate2(p, shape_rotation + auto_rot_angle(cid));
-			float sd = shape_sdf(p);
-			if (outline_only > 0.5)
-				sd = abs(sd) - stroke_w * 0.5;
-			float a = 1.0 - smoothstep(-0.75, 0.75, sd);
-			float ta = a;
-			if (twinkle_amount > 0.001)
-				ta *= twinkle_alpha_calc(cid);
-			// Color follows the instance with the most raw coverage
-			// so a faded-out neighbor never steals it.
-			if (a > best_a) {
-				best_a = a;
-				color_cid = cid;
-			}
-			alpha = max(alpha, ta);
-		}
-	}
-	return float4(cell_rgb(color_cid), shape_color.a * alpha * mask);
-}
-
-float4 PSBorderImage(VertData v_in) : TARGET
-{
-	float2 frag_px = v_in.uv * canvas_size;
-	float mask = border_shape_mask(frag_px);
-	if (mask <= 0.0)
-		return float4(0.0, 0.0, 0.0, 0.0);
-	float cs = max(cell_size, 1.0);
-	float extent = border_extent();
-	int reach = border_reach(extent);
-	int rows = int(clamp(border_rows, 1.0, 8.0));
-	float2 half_ext = float2(shape_size, shape_size) * 0.5;
-	if (tex_aspect >= 1.0)
-		half_ext.y /= tex_aspect;
-	else
-		half_ext.x *= tex_aspect;
-
-	float best_dist2 = 1.0e12;
-	float2 best_p = float2(0.0, 0.0);
-	float2 best_cid = float2(0.0, 0.0);
-	float found = 0.0;
-	for (int j = 0; j < rows; ++j) {
-		BorderRow br = border_make_row((float(j) + 0.5) / float(rows), cs);
-		if (br.total < 0.5)
-			continue;
-		float pd;
-		float pu = border_row_project(br, frag_px, pd);
-		if (pd > extent + 2.0)
-			continue;
-		float phase = border_row_phase(float(j), cs);
-		float base = floor(pu - phase + 0.5);
-		for (int d = -reach; d <= reach; ++d) {
-			float k = base + float(d);
-			float2 cid = float2(border_wrap(k, br.total), float(j));
-			if (!cell_belongs_to_this_item(cid))
-				continue;
-			float ang;
-			float2 pos = border_row_point(br, border_wrap(k + phase, br.total), ang);
-			float2 p = border_local(frag_px, pos, ang, cid, cs);
-			p = rotate2(p, shape_rotation + auto_rot_angle(cid));
-			if (abs(p.x) <= half_ext.x && abs(p.y) <= half_ext.y) {
-				float d2 = dot(p, p);
-				if (d2 < best_dist2) {
-					best_dist2 = d2;
-					best_p = p;
-					best_cid = cid;
-					found = 1.0;
-				}
-			}
-		}
-	}
-	if (found < 0.5)
-		return float4(0.0, 0.0, 0.0, 0.0);
-	float2 uv = best_p / (half_ext * 2.0) + 0.5;
-	float4 tex = cell_texture.Sample(TileSampler, uv);
-	float3 tint = cell_rgb(best_cid);
-	if (image_color_mode > 1.5)
-		tex.rgb = tint;
-	else if (image_color_mode > 0.5)
-		tex.rgb *= tint;
-	tex.a *= shape_color.a * mask;
-	if (twinkle_amount > 0.001)
-		tex.a *= twinkle_alpha_calc(best_cid);
-	return tex;
-}
-
-// Draws the filtered source clipped to a rounded box covering it.
-float4 PSSourceRounded(VertData v_in) : TARGET
-{
-	float4 c = image.Sample(TileSampler, v_in.uv);
-	float2 half_s = src_size * 0.5;
-	float4 r = min(src_radii, min(half_s.x, half_s.y));
-	float d = sd_rbox(v_in.uv * src_size - half_s, half_s, r);
-	return c * (1.0 - smoothstep(-0.5, 0.5, d));
-}
-
-float4 PSShape(VertData v_in) : TARGET
-{
-	float2 frag_px = v_in.uv * canvas_size;
-	int reach = tile_reach();
-	float stroke_w = max(stroke_thickness, 0.001) * shape_size;
-	float alpha;
-	float2 color_cid = float2(0.0, 0.0);
-	if (twinkle_amount > 0.001) {
-		// Twinkle needs a per-cell fade, so coverage is computed per
-		// instance and combined with max() instead of taking the union
-		// SDF. The SDFs are true pixel distances, so a fixed ~0.75 px
-		// smoothing gives the same anti-aliasing as the fwidth path.
-		alpha = 0.0;
-		float best_a = -1.0;
-		for (int dr = -reach; dr <= reach; ++dr) {
-			for (int dc = -reach; dc <= reach; ++dc) {
-				float2 cid;
-				float2 p = cell_local_at(frag_px, dc, dr, cid);
-				if (!cell_belongs_to_this_item(cid))
-					continue;
-				p = rotate2(p, shape_rotation + auto_rot_angle(cid));
-				float d = shape_sdf(p);
-				if (outline_only > 0.5)
-					d = abs(d) - stroke_w * 0.5;
-				float a = 1.0 - smoothstep(-0.75, 0.75, d);
-				float ta = a * twinkle_alpha_calc(cid);
-				// Color follows the instance with the largest
-				// raw coverage so a faded-out neighbor never
-				// steals the color of the visible shape.
-				if (a > best_a) {
-					best_a = a;
-					color_cid = cid;
-				}
-				alpha = max(alpha, ta);
-			}
-		}
+	if (ring_mode > 0.5) {
+		// A line that follows the frame is one continuous ring per row:
+		// a single quad over the canvas, shaded by distance to the path.
+		cid = float2(0.0, row_index);
+		center = canvas_size * 0.5;
+	} else if (border_mode > 0.5) {
+		cid = float2(q, row_index);
+		center = border_point(wrapf(q + row_phase, max(row_total, 1.0)), heading, spacing);
+		float2 tng = float2(cos(heading), sin(heading));
+		center += float2(-tng.y, tng.x) * offset_inward;
+		center += wander_offset(cid, cs);
+		if (border_align < 0.5)
+			heading = 0.0;
 	} else {
-		float best_d = 1.0e6;
-		for (int dr = -reach; dr <= reach; ++dr) {
-			for (int dc = -reach; dc <= reach; ++dc) {
-				float2 cid;
-				float2 p = cell_local_at(frag_px, dc, dr, cid);
-				if (!cell_belongs_to_this_item(cid))
-					continue;
-				p = rotate2(p, shape_rotation + auto_rot_angle(cid));
-				float d = shape_sdf(p);
-				if (d < best_d) {
-					best_d = d;
-					color_cid = cid;
-				}
-			}
+		float j = floor(q / col_count);
+		float ci = q - j * col_count;
+		if (ci < 0.0) {
+			j -= 1.0;
+			ci += col_count;
+		} else if (ci >= col_count) {
+			j += 1.0;
+			ci -= col_count;
 		}
-		if (outline_only > 0.5) {
-			// Replace the filled SDF with a stroke of width
-			// stroke_thickness * shape_size centered on the shape edge
-			// (d in [-w/2, +w/2]), so every shape's outline renders with
-			// the same visual weight regardless of its SDF interior.
-			best_d = abs(best_d) - stroke_w * 0.5;
+		float rl = row_first + j;
+		float row_id = wrapf(rl - row_wrap, 4096.0);
+		bool odd = wrapf(row_id, 2.0) > 0.5;
+
+		// Whole cells and px this row has scrolled: exact integer
+		// arithmetic in float (every product stays below 2^24).
+		float rq = 64.0;
+		if (drift_speed_amt > 0.0) {
+			float s = (hash11(float2(row_id, 7.0), drift_speed_seed) - 0.5) * 2.0 * drift_speed_amt;
+			rq = clamp(floor(64.0 * (1.0 + s) + 0.5), 0.0, 128.0);
 		}
-		// best_d is discontinuous where cell ownership changes
-		// (step-and-repeat) or across brick-shifted rows, so an unbounded
-		// fwidth() explodes there and smoothstep leaves ~50% alpha seams
-		// along cell borders. The SDFs are true pixel distances, so the
-		// real edge width never exceeds ~2 px.
-		float edge = clamp(fwidth(best_d), 0.5, 2.0);
-		alpha = 1.0 - smoothstep(-edge, edge, best_d);
+		float p = wrapf(col_cells * rq, 64.0 * col_period);
+		float whole = floor(p / 64.0);
+		float sub = (p - whole * 64.0) / 64.0 * cs + col_frac * rq / 64.0;
+		if (alt_lines > 0.5 && odd) {
+			whole = wrapf(-whole, col_period);
+			sub = -sub;
+		}
+		float brick_px = (brick > 0.5 && odd) ? cs * 0.5 : 0.0;
+		float col_local = ceil((along_min - sub - brick_px) / cs) + ci;
+		cid = float2(wrapf(col_local - whole, col_period), row_id);
+
+		float2 lat = float2(col_local * cs + sub + brick_px, rl * cs + perp_frac);
+		lat += wander_offset(cid, cs);
+		float2 perp = float2(-lattice_dir.y, lattice_dir.x);
+		center = origin + lattice_dir * lat.x + perp * lat.y;
+		heading = atan2(lattice_dir.y, lattice_dir.x);
+		valid = owns_cell(cid);
 	}
-	alpha *= vignette_mask_calc(frag_px) * border_shape_mask(frag_px);
-	return float4(cell_rgb(color_cid), shape_color.a * alpha);
+
+	float alpha = shape_color.a * twinkle_alpha(cid);
+	if (alpha < 0.002)
+		valid = false;
+
+	float2 half_ext = quad_half;
+	if (line_axis > 1.5)
+		half_ext.y = spacing * 0.5;
+	else if (line_axis > 0.5)
+		half_ext.x = spacing * 0.5;
+	float2 local = corner * half_ext;
+	float2 offs = local;
+	if (ring_mode < 0.5)
+		offs = rotate2(rotate2(local, -(shape_rotation + auto_rot_angle(cid))), heading);
+	float2 screen = center + offs;
+
+	v_out.pos = valid ? mul(float4(screen, 0.0, 1.0), ViewProj) : float4(2.0, 2.0, 2.0, 1.0);
+	v_out.local = local;
+	v_out.screen = screen;
+	v_out.color = float4(cell_rgb(cid), alpha);
+	return v_out;
 }
 
-float4 PSImage(VertData v_in) : TARGET
-{
-	float2 frag_px = v_in.uv * canvas_size;
-	int reach = tile_reach();
-	// Fit the texture inside the shape_size square, keeping its aspect.
-	float2 half_ext = float2(shape_size, shape_size) * 0.5;
-	if (tex_aspect >= 1.0)
-		half_ext.y /= tex_aspect;
-	else
-		half_ext.x *= tex_aspect;
+// ----------------------------------------------------------- pixel shaders
 
-	float best_dist2 = 1.0e12;
-	float2 best_p = float2(0.0, 0.0);
-	float2 best_cid = float2(0.0, 0.0);
-	float found = 0.0;
-	for (int dr = -reach; dr <= reach; ++dr) {
-		for (int dc = -reach; dc <= reach; ++dc) {
-			float2 cid;
-			float2 p = cell_local_at(frag_px, dc, dr, cid);
-			if (!cell_belongs_to_this_item(cid))
-				continue;
-			p = rotate2(p, shape_rotation + auto_rot_angle(cid));
-			if (abs(p.x) <= half_ext.x && abs(p.y) <= half_ext.y) {
-				float d2 = dot(p, p);
-				if (d2 < best_dist2) {
-					best_dist2 = d2;
-					best_p = p;
-					best_cid = cid;
-					found = 1.0;
-				}
-			}
-		}
-	}
-	if (found < 0.5)
-		return float4(0.0, 0.0, 0.0, 0.0);
-	float2 uv = best_p / (half_ext * 2.0) + 0.5;
+// Distance to the current border row's path, moved offset_inward px inside.
+float ring_sdf(float2 px)
+{
+	float o = offset_inward;
+	float2 lo = row_box.xy + o;
+	float2 hi = max(row_box.zw - o, lo);
+	float2 b = (hi - lo) * 0.5;
+	float4 r = min(max(row_rad - o, 0.0), min(b.x, b.y));
+	return abs(sd_rbox(px - (lo + hi) * 0.5, b, r)) - shape_size * 0.5;
+}
+
+float4 PSShape(InstVert v_in) : TARGET
+{
+	float d = (ring_mode > 0.5) ? ring_sdf(v_in.screen) : shape_sdf(v_in.local);
+	if (outline_only > 0.5)
+		d = abs(d) - max(stroke_thickness, 0.001) * shape_size * 0.5;
+	float edge = clamp(fwidth(d), 0.5, 2.0) * 0.75;
+	float a = (1.0 - smoothstep(-edge, edge, d)) * v_in.color.a * masks(v_in.screen);
+	return float4(v_in.color.rgb * a, a);
+}
+
+float4 PSImage(InstVert v_in) : TARGET
+{
+	float2 uv = v_in.local / (quad_half * 2.0) + 0.5;
 	float4 tex = cell_texture.Sample(TileSampler, uv);
-	// shape_color carries the tint color and, in alpha, the item opacity.
-	// Opacity only scales alpha: the SRCALPHA blend already weights rgb by
-	// it, so scaling rgb as well would darken semi-transparent items.
-	float3 tint = cell_rgb(best_cid);
 	if (image_color_mode > 1.5)
-		tex.rgb = tint;
+		tex.rgb = v_in.color.rgb * tex.a;
 	else if (image_color_mode > 0.5)
-		tex.rgb *= tint;
-	tex.a *= shape_color.a * vignette_mask_calc(frag_px) * border_shape_mask(frag_px);
-	if (twinkle_amount > 0.001)
-		tex.a *= twinkle_alpha_calc(best_cid);
-	return tex;
+		tex.rgb *= v_in.color.rgb;
+	return tex * (v_in.color.a * masks(v_in.screen));
 }
 
 float4 PSBackground(VertData v_in) : TARGET
@@ -935,13 +658,26 @@ float4 PSBackground(VertData v_in) : TARGET
 			t = dot(px - half_canvas, bg_dir) / max(2.0 * extent, 1.0) + 0.5;
 		}
 		c = lerp(bg_color, bg_color2, saturate(t));
-		// Dark gradients band visibly in 8-bit output; one LSB of noise
+		// Dark gradients band visibly in 8-bit output; one code of
+		// noise (in the encoded space the output is quantized in)
 		// hides it.
 		c.rgb += (hash11(floor(px), 0.0) - 0.5) / 255.0;
 	}
+	float3 lin = float3(srgb_to_linear(saturate(c.r)), srgb_to_linear(saturate(c.g)), srgb_to_linear(saturate(c.b)));
+	float a = c.a;
 	if (border_active > 0.5)
-		c.a *= border_band_mask(px);
-	return c;
+		a *= border_band_mask(px);
+	return float4(lin * a, a);
+}
+
+// Draws the filtered source clipped to a rounded box covering it.
+float4 PSSourceRounded(VertData v_in) : TARGET
+{
+	float4 c = image.Sample(TileSampler, v_in.uv);
+	float2 half_s = src_size * 0.5;
+	float4 r = min(src_radii, min(half_s.x, half_s.y));
+	float d = sd_rbox(v_in.uv * src_size - half_s, half_s, r);
+	return c * (1.0 - smoothstep(-0.5, 0.5, d));
 }
 
 technique DrawBackground
@@ -957,7 +693,7 @@ technique DrawShape
 {
 	pass
 	{
-		vertex_shader = VSDefault(v_in);
+		vertex_shader = VSInstance(id);
 		pixel_shader  = PSShape(v_in);
 	}
 }
@@ -966,26 +702,8 @@ technique DrawImage
 {
 	pass
 	{
-		vertex_shader = VSDefault(v_in);
+		vertex_shader = VSInstance(id);
 		pixel_shader  = PSImage(v_in);
-	}
-}
-
-technique DrawBorderShape
-{
-	pass
-	{
-		vertex_shader = VSDefault(v_in);
-		pixel_shader  = PSBorderShape(v_in);
-	}
-}
-
-technique DrawBorderImage
-{
-	pass
-	{
-		vertex_shader = VSDefault(v_in);
-		pixel_shader  = PSBorderImage(v_in);
 	}
 }
 

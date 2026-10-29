@@ -7,7 +7,16 @@ uniform float2 canvas_size;
 uniform float noise_seed;
 uniform float zoom_amount;    // > 0; higher values zoom in on the map
 uniform float smoothness;     // 0 = angular lattice edges, 1 = fully smoothed
-uniform float2 drift_offset;  // accumulated map-space slide (Location Drift)
+// Location Drift, split per noise octave so no large value reaches the GPU:
+// octave k samples the lattice at M^k * local + offset, where the CPU
+// computes each offset in double as a whole lattice index (xy, wrapped at
+// 4096 like the hash) and a fraction (zw).
+uniform float4 oct_off0;
+uniform float4 oct_off1;
+uniform float4 oct_off2;
+uniform float4 oct_off3;
+uniform float4 oct_off4;
+uniform float2 grid_offset;   // drift modulo one grid cell, map units
 uniform float contour_levels; // contour line count across the full height range
 
 uniform float line_half_px;
@@ -37,18 +46,38 @@ VertData VSDefault(VertData v_in)
 	return v_out;
 }
 
-float thash(float2 p)
+float wrapf(float x, float m)
 {
-	return frac(sin(dot(p, float2(127.1, 311.7)) + noise_seed * 269.5) * 43758.5453);
+	float r = x - floor(x / m) * m;
+	if (r < 0.0)
+		r += m;
+	if (r >= m)
+		r -= m;
+	return r;
+}
+
+// Sine-free hash of a lattice index (Dave Hoskins' hash12); the index is
+// wrapped at 4096, so inputs stay small and results match across GPUs.
+float thash(float2 i)
+{
+	float2 p = float2(wrapf(i.x, 4096.0), wrapf(i.y, 4096.0)) + noise_seed * float2(0.7548777, 0.5698403);
+	float3 p3 = frac(float3(p.x, p.y, p.x) * 0.1031);
+	p3 += dot(p3, float3(p3.y, p3.z, p3.x) + 33.33);
+	return frac((p3.x + p3.y) * p3.z);
+}
+
+float srgb_to_linear(float c)
+{
+	return (c <= 0.04045) ? (c / 12.92) : pow((c + 0.055) / 1.055, 2.4);
 }
 
 // Value noise plus its analytic map-space gradient. Screen-space ddx/ddy of
 // the height field is only sampled once per 2x2 pixel quad, and that noisy
 // estimate fed the line-width math with grain that widened lines into
 // blurred patches; the closed-form derivative is exact and smooth.
-float vnoise_grad(float2 p, out float2 g)
+float vnoise_grad(float2 p, float2 ioff, out float2 g)
 {
-	float2 i = floor(p);
+	float2 i = floor(p) + ioff;
 	float2 f = frac(p);
 	float s = saturate(smoothness);
 	// Blend between linear and quintic lattice interpolation: low smoothness
@@ -67,6 +96,20 @@ float vnoise_grad(float2 p, out float2 g)
 	return lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y);
 }
 
+float4 octave_offset(int i)
+{
+	if (i == 0)
+		return oct_off0;
+	if (i == 1)
+		return oct_off1;
+	if (i == 2)
+		return oct_off2;
+	if (i == 3)
+		return oct_off3;
+	return oct_off4;
+}
+
+// p is the map position relative to the drift (see oct_off*).
 float height_grad_at(float2 p, out float2 grad)
 {
 	float v = 0.0;
@@ -78,10 +121,12 @@ float height_grad_at(float2 p, out float2 grad)
 	grad = float2(0.0, 0.0);
 	for (int i = 0; i < 5; i++) {
 		float2 g;
-		v += amp * vnoise_grad(q, g);
+		float4 off = octave_offset(i);
+		v += amp * vnoise_grad(q + off.zw, off.xy, g);
 		grad += amp * float2(g.x * J.x + g.y * J.z, g.x * J.y + g.y * J.w);
-		// Rotate-and-scale between octaves so ridges don't align with axes.
-		q = float2(q.x * 1.6 - q.y * 1.2, q.x * 1.2 + q.y * 1.6) + 31.4;
+		// Rotate-and-scale between octaves so ridges don't align with
+		// axes (the octaves' constant shifts live in oct_off*).
+		q = float2(q.x * 1.6 - q.y * 1.2, q.x * 1.2 + q.y * 1.6);
 		J = float4(1.6 * J.x - 1.2 * J.z, 1.6 * J.y - 1.2 * J.w,
 			   1.2 * J.x + 1.6 * J.z, 1.2 * J.y + 1.6 * J.w);
 		amp *= 0.5;
@@ -104,7 +149,7 @@ float4 PSTopo(VertData v_in) : TARGET
 	float z = max(zoom_amount, 0.01);
 	// Map space: one noise cell spans 100 px at zoom 1. Zoom scales around
 	// the source center so it reads like a camera moving over a fixed map.
-	float2 world = (frag_px - canvas_size * 0.5) / (100.0 * z) + drift_offset;
+	float2 world = (frag_px - canvas_size * 0.5) / (100.0 * z);
 
 	float2 hg;
 	float f = height_grad_at(world, hg) * contour_levels;
@@ -134,7 +179,7 @@ float4 PSTopo(VertData v_in) : TARGET
 			// lines still cross at the source midpoint. Distances convert
 			// back to pixels so line thickness stays constant on screen.
 			float gs_world = max(grid_size_px, 4.0) / 100.0;
-			float2 gd = abs(frac(world / gs_world + 0.5) - 0.5) * gs_world * 100.0 * z;
+			float2 gd = abs(frac((world + grid_offset) / gs_world + 0.5) - 0.5) * gs_world * 100.0 * z;
 			gd_px = min(gd.x, gd.y);
 		} else {
 			// Screen-fixed grid: a static HUD-style overlay centered on
@@ -168,7 +213,10 @@ float4 PSTopo(VertData v_in) : TARGET
 	float la = line_mask * line_color.a * speck_fade;
 	outc = blend_over(outc, float4(line_color.rgb, la));
 
-	return outc;
+	// Colors are mixed in sRGB like a paint program; the output is linear
+	// and premultiplied (see cfx_draw_begin).
+	float3 lin = float3(srgb_to_linear(outc.r), srgb_to_linear(outc.g), srgb_to_linear(outc.b));
+	return float4(lin * outc.a, outc.a);
 }
 
 technique Draw

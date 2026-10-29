@@ -11,61 +11,17 @@ the Free Software Foundation; either version 2 of the License, or
 #pragma once
 
 #include <obs-module.h>
-#include <graphics/image-file.h>
 #include "shape-defs.h"
 
-struct cpat_item {
-	bool enabled;
-	int kind;
-	int shape;
-	int polygon_sides;
-	float stroke_thickness;
-	bool outline_only;
-	struct vec4 color;
-
-	char *image_path;
-	gs_image_file_ex_t image;
-	bool image_loaded;
-	int image_color_mode;
-	struct vec4 image_tint;
-	float image_opacity;
-	bool keep_aspect;
-
-	/* Random Color Per Cell: each cell picks its color from the item's
-	 * main color (shape color or image tint) and these two extras. */
-	bool random_colors;
-	struct vec4 color_b;
-	struct vec4 color_c;
-
-	/* SVG images are kept as vector data and rasterized at the item's
-	 * size, so they stay sharp however large the item is drawn. */
-	struct NSVGimage *svg;
-	gs_texture_t *svg_texture;
-	uint32_t svg_px;
-
-	char *source_name;
-	obs_weak_source_t *source_ref;
-	gs_texrender_t *source_texrender;
-	uint32_t source_w, source_h;
-
-	float size;
-	float rotation_deg;
-	float offset_x;
-	float offset_y;
-	float density;
-
-	int twinkle_mode;
-	float twinkle_amount;
-	float twinkle_speed;
-
-	int speed_drift_mode;
-	float speed_drift_amount;
-
-	int autorot_mode;
-	float autorot_speed;
-	int autorot_style;
-	float autorot_seed;
-};
+/* The pattern renderer behind Pattern Background, Pattern Filter and Pattern
+ * Border.
+ *
+ * Threading: update() and the properties callbacks run on the UI thread,
+ * tick() and the render calls on the graphics thread. update() never touches
+ * render state. It parses the settings into a new configuration, decodes any
+ * new image or SVG off the graphics thread, and queues the result; tick()
+ * swaps it in and uploads textures, so render() always sees one consistent
+ * configuration and never a texture that is being replaced. */
 
 /* Which plugin type is hosting the renderer. It decides the defaults and
  * which property groups are shown. */
@@ -80,6 +36,8 @@ enum cpat_host {
  * edge inset by the per-side widths. */
 struct cpat_border {
 	bool active;
+	int position;
+	bool round_source;
 	int layout;
 	float left, top, right, bottom;
 	float radius;
@@ -90,81 +48,36 @@ struct cpat_border {
 	bool align;
 };
 
-struct cpat_renderer {
-	obs_source_t *owner;
-	enum cpat_host host;
+struct cpat_renderer;
 
-	uint32_t width, height;
-	bool has_background;
-	int background_type;
-	struct vec4 background_color;
-	struct vec4 background_color2;
-	float background_angle_deg;
-	float anchor_x_pct;
-	float anchor_y_pct;
-	float canvas_rotation_deg;
-
-	uint32_t item_count;
-	struct cpat_item items[CONSTELLATIONS_MAX_ITEMS];
-
-	int layout_mode;
-	int grid_order;
-
-	float motion_angle_deg;
-	float motion_speed;
-	bool alternating_lines;
-	bool speed_drift;
-	float speed_drift_amount;
-	bool location_drift;
-	float location_drift_amount;
-
-	bool twinkle_enabled;
-	float twinkle_amount;
-	float twinkle_speed;
-
-	bool autorot_enabled;
-	float autorot_speed;
-	int autorot_style;
-	float autorot_seed;
-
-	bool vignette_enabled;
-	float vignette_size;
-	float vignette_anchor_x_pct;
-	float vignette_anchor_y_pct;
-	float vignette_direction_deg;
-	int vignette_shape;
-	int vignette_polygon_sides;
-	float vignette_softness;
-	bool vignette_inverted;
-
-	/* Accumulated motion in lattice coordinates (along-row, cross-row).
-	 * Integrating each tick means speed and angle changes steer the pattern
-	 * instead of teleporting it, and keeping the components in the lattice
-	 * frame means canvas rotation pivots on the anchor no matter how far
-	 * the pattern has scrolled. */
-	double motion_off_along, motion_off_perp;
-	double elapsed_time;
-
-	/* Pattern Border only: the band geometry, and how far (px) the shapes
-	 * have marched along the frame (positive is clockwise). */
-	struct cpat_border border;
-	double border_march;
-
-	gs_effect_t *effect;
-};
-
-void cpat_renderer_init(struct cpat_renderer *r, obs_source_t *owner, enum cpat_host host);
-void cpat_renderer_free(struct cpat_renderer *r);
+struct cpat_renderer *cpat_renderer_create(obs_source_t *owner, enum cpat_host host, obs_data_t *settings);
+void cpat_renderer_destroy(struct cpat_renderer *r);
 
 void cpat_renderer_set_defaults(obs_data_t *settings, enum cpat_host host);
-void cpat_renderer_get_properties(struct cpat_renderer *r, obs_properties_t *props, enum cpat_host host);
+/* Adds the pattern's properties to `props`, after anything the host added.
+ * `r` is NULL when OBS asks for properties without an instance. */
+void cpat_renderer_add_properties(struct cpat_renderer *r, obs_properties_t *props, enum cpat_host host);
 void cpat_renderer_update(struct cpat_renderer *r, obs_data_t *settings);
+/* Called from the host's load callback, once every source of the scene
+ * collection exists: links items saved by name to the source's UUID. */
+void cpat_renderer_load(struct cpat_renderer *r, obs_data_t *settings);
 
+/* Graphics thread. */
 void cpat_renderer_tick(struct cpat_renderer *r, float seconds);
+void cpat_renderer_show(struct cpat_renderer *r, bool showing);
+void cpat_renderer_activate(struct cpat_renderer *r, bool active);
 void cpat_renderer_render_background(struct cpat_renderer *r, uint32_t w, uint32_t h);
 void cpat_renderer_render_items(struct cpat_renderer *r, uint32_t w, uint32_t h);
 
-/* Corner radii (top-left, top-right, bottom-right, bottom-left) of the
- * border's outer and inner edges for a w x h frame. */
-void cpat_border_corner_radii(const struct cpat_renderer *r, uint32_t w, uint32_t h, struct vec4 *outer,
+/* Pattern Background's canvas size (any thread). */
+uint32_t cpat_renderer_width(const struct cpat_renderer *r);
+uint32_t cpat_renderer_height(const struct cpat_renderer *r);
+
+/* Pattern Border helpers. The geometry comes from the settings, so the host
+ * reads its own copy for sizing; the renderer reads another for drawing. */
+void cpat_border_read_settings(obs_data_t *settings, struct cpat_border *b);
+void cpat_border_corner_radii(const struct cpat_border *b, uint32_t w, uint32_t h, struct vec4 *outer,
 			      struct vec4 *inner);
+/* Finishes the filter by drawing its source clipped to a rounded box. */
+void cpat_renderer_draw_source_rounded(struct cpat_renderer *r, obs_source_t *filter, uint32_t w, uint32_t h,
+				       const struct vec4 *radii);
