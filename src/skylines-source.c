@@ -11,48 +11,85 @@ the Free Software Foundation; either version 2 of the License, or
 #include <obs-module.h>
 #include <plugin-support.h>
 #include <util/threading.h>
+#include <math.h>
 
 #include "shape-defs.h"
+#include "common.h"
+#include "lattice.h"
 
-struct csky_source {
-	obs_source_t *self;
-	bool is_filter;
+/* Buildings repeat after this many slots, matching the shader. */
+#define CSKY_SLOT_PERIOD 4096.0
 
+enum {
+	P_CANVAS_SIZE,
+	P_NOISE_SEED,
+	P_DRIFT_SLOTS,
+	P_DRIFT_FRAC_PX,
+	P_HEIGHT_VARIATION,
+	P_MIN_HEIGHT,
+	P_WIDTH_VARIATION,
+	P_MIN_WIDTH,
+	P_SHADE_VARIATION,
+	P_WINDOW_OCCUPANCY,
+	P_BUILDING_COLOR,
+	P_WINDOW_ON_COLOR,
+	P_WINDOW_OFF_COLOR,
+	P_TWINKLE_ACTIVE,
+	P_TWINKLE_PHASE,
+	P_COUNT,
+};
+
+static const char *const param_names[] = {
+	"canvas_size",    "noise_seed",      "drift_slots",      "drift_frac_px",   "height_variation",
+	"min_height",     "width_variation", "min_width",        "shade_variation", "window_occupancy",
+	"building_color", "window_on_color", "window_off_color", "twinkle_active",  "twinkle_phase",
+};
+_Static_assert(OBS_COUNTOF(param_names) == P_COUNT, "param_names must list every P_ uniform");
+
+struct csky_config {
 	uint32_t width, height;
 	int seed;
-
 	float height_variation;
 	float min_height;
 	float width_variation;
 	float min_width;
 	float shade_variation;
 	float window_occupancy;
+	/* sRGB-encoded; the shader mixes in sRGB */
 	struct vec4 building_color;
 	struct vec4 window_on_color;
 	struct vec4 window_off_color;
-
 	bool drift;
 	float drift_speed;
-
 	bool twinkle;
 	float twinkle_speed;
+};
 
+struct csky_source {
+	obs_source_t *self;
+	bool is_filter;
+	struct cfx_effect fx;
+
+	/* update() runs on the UI thread: it fills `pending`, and tick()
+	 * copies it to `cfg`, so a frame never mixes old and new settings. */
+	pthread_mutex_t mutex;
+	struct csky_config pending;
+	bool has_pending;
+	volatile long width, height;
+
+	/* Graphics thread. */
+	struct csky_config cfg;
 	/* Integrated each tick so speed changes steer the motion instead of
 	 * teleporting the skyline or snapping every window's fade. */
 	double drift_px;
-	double twinkle_phase;
-
-	gs_effect_t *effect;
+	double twinkle_phase; /* cycles, wrapped */
 
 	/* A static skyline (no drift, no twinkle) is rendered once into this
 	 * cache and blitted afterwards, instead of re-evaluating the
-	 * procedural shader for every pixel every frame. The cache tracks the
-	 * settings revision it was rendered at instead of a valid flag: update()
-	 * runs on the UI thread, and a flag it clears could be set back by a
-	 * render that was already in flight, silently dropping the change. */
+	 * procedural shader for every pixel every frame. cfg_rev counts
+	 * applied configurations; the cache remembers the one it holds. */
 	gs_texrender_t *cache;
-	volatile long settings_rev;
-	long cache_rev;
+	uint64_t cfg_rev, cache_rev;
 	uint32_t cache_w, cache_h;
 };
 
@@ -71,37 +108,38 @@ static const char *csky_filter_get_name(void *unused)
 static void csky_update(void *data, obs_data_t *settings)
 {
 	struct csky_source *s = data;
-
+	struct csky_config c = {0};
 	if (!s->is_filter) {
-		s->width = (uint32_t)obs_data_get_int(settings, "width");
-		s->height = (uint32_t)obs_data_get_int(settings, "height");
-		if (s->width == 0)
-			s->width = 1920;
-		if (s->height == 0)
-			s->height = 1080;
+		c.width = (uint32_t)obs_data_get_int(settings, "width");
+		c.height = (uint32_t)obs_data_get_int(settings, "height");
+		if (c.width == 0)
+			c.width = 1920;
+		if (c.height == 0)
+			c.height = 1080;
 	}
+	c.seed = (int)obs_data_get_int(settings, "seed");
+	c.height_variation = (float)obs_data_get_double(settings, "height_variation");
+	c.min_height = (float)obs_data_get_double(settings, "min_height");
+	c.width_variation = (float)obs_data_get_double(settings, "width_variation");
+	c.min_width = (float)obs_data_get_double(settings, "min_width");
+	c.shade_variation = (float)obs_data_get_double(settings, "shade_variation");
+	c.window_occupancy = (float)obs_data_get_double(settings, "window_occupancy");
+	vec4_from_rgba(&c.building_color, (uint32_t)obs_data_get_int(settings, "building_color"));
+	vec4_from_rgba(&c.window_on_color, (uint32_t)obs_data_get_int(settings, "window_on_color"));
+	vec4_from_rgba(&c.window_off_color, (uint32_t)obs_data_get_int(settings, "window_off_color"));
+	c.drift = obs_data_get_bool(settings, "location_drift");
+	c.drift_speed = (float)obs_data_get_double(settings, "location_drift_speed");
+	c.twinkle = obs_data_get_bool(settings, "window_twinkle");
+	c.twinkle_speed = (float)obs_data_get_double(settings, "twinkle_speed");
+	if (c.twinkle_speed < 0.0f)
+		c.twinkle_speed = 0.0f;
 
-	s->seed = (int)obs_data_get_int(settings, "seed");
-
-	s->height_variation = (float)obs_data_get_double(settings, "height_variation");
-	s->min_height = (float)obs_data_get_double(settings, "min_height");
-	s->width_variation = (float)obs_data_get_double(settings, "width_variation");
-	s->min_width = (float)obs_data_get_double(settings, "min_width");
-	s->shade_variation = (float)obs_data_get_double(settings, "shade_variation");
-	s->window_occupancy = (float)obs_data_get_double(settings, "window_occupancy");
-	vec4_from_rgba(&s->building_color, (uint32_t)obs_data_get_int(settings, "building_color"));
-	vec4_from_rgba(&s->window_on_color, (uint32_t)obs_data_get_int(settings, "window_on_color"));
-	vec4_from_rgba(&s->window_off_color, (uint32_t)obs_data_get_int(settings, "window_off_color"));
-
-	s->drift = obs_data_get_bool(settings, "location_drift");
-	s->drift_speed = (float)obs_data_get_double(settings, "location_drift_speed");
-
-	s->twinkle = obs_data_get_bool(settings, "window_twinkle");
-	s->twinkle_speed = (float)obs_data_get_double(settings, "twinkle_speed");
-	if (s->twinkle_speed < 0.0f)
-		s->twinkle_speed = 0.0f;
-
-	os_atomic_inc_long(&s->settings_rev);
+	os_atomic_set_long(&s->width, (long)c.width);
+	os_atomic_set_long(&s->height, (long)c.height);
+	pthread_mutex_lock(&s->mutex);
+	s->pending = c;
+	s->has_pending = true;
+	pthread_mutex_unlock(&s->mutex);
 }
 
 static void *csky_create_common(obs_data_t *settings, obs_source_t *source, bool is_filter)
@@ -109,38 +147,16 @@ static void *csky_create_common(obs_data_t *settings, obs_source_t *source, bool
 	struct csky_source *s = bzalloc(sizeof(*s));
 	s->self = source;
 	s->is_filter = is_filter;
-
-	char *path = obs_module_file("effects/skylines.effect");
-	if (path) {
+	pthread_mutex_init_value(&s->mutex);
+	if (pthread_mutex_init(&s->mutex, NULL) != 0) {
+		bfree(s);
+		return NULL;
+	}
+	if (cfx_effect_load(&s->fx, "skylines.effect", param_names, P_COUNT)) {
 		obs_enter_graphics();
-		char *errors = NULL;
-		s->effect = gs_effect_create_from_file(path, &errors);
 		s->cache = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
 		obs_leave_graphics();
-		if (!s->effect)
-			obs_log(LOG_ERROR, "Constellations: failed to compile skylines.effect: %s",
-				errors ? errors : "(no detail)");
-		bfree(errors);
-		bfree(path);
-	} else {
-		obs_log(LOG_ERROR, "Constellations: skylines.effect not found");
 	}
-
-	/* Every uniform upload is guarded by a param-exists check, so an
-	 * outdated skylines.effect on disk makes the newer sliders silently do
-	 * nothing while the rest keep working. Call that out loudly instead. */
-	if (s->effect) {
-		static const char *const required[] = {"min_height", "min_width", "shade_variation"};
-		for (size_t i = 0; i < sizeof(required) / sizeof(required[0]); ++i) {
-			if (!gs_effect_get_param_by_name(s->effect, required[i]))
-				obs_log(LOG_WARNING,
-					"Constellations: skylines.effect has no uniform '%s'; the installed "
-					"data files are older than the plugin binary, so its slider will do "
-					"nothing. Reinstall the plugin to update the data files.",
-					required[i]);
-		}
-	}
-
 	csky_update(s, settings);
 	return s;
 }
@@ -158,121 +174,94 @@ static void *csky_filter_create(obs_data_t *settings, obs_source_t *source)
 static void csky_destroy(void *data)
 {
 	struct csky_source *s = data;
-	if (s->effect || s->cache) {
+	if (s->cache) {
 		obs_enter_graphics();
-		if (s->effect)
-			gs_effect_destroy(s->effect);
-		if (s->cache)
-			gs_texrender_destroy(s->cache);
+		gs_texrender_destroy(s->cache);
 		obs_leave_graphics();
 	}
+	cfx_effect_free(&s->fx);
+	pthread_mutex_destroy(&s->mutex);
 	bfree(s);
 }
 
 static void csky_tick(void *data, float seconds)
 {
 	struct csky_source *s = data;
+	pthread_mutex_lock(&s->mutex);
+	if (s->has_pending) {
+		s->cfg = s->pending;
+		s->has_pending = false;
+		s->cfg_rev++;
+	}
+	pthread_mutex_unlock(&s->mutex);
+
+	const struct csky_config *c = &s->cfg;
 	/* Positive drift speed slides the buildings to the right. */
-	if (s->drift && s->drift_speed != 0.0f)
-		s->drift_px -= (double)s->drift_speed * (double)seconds;
-	if (s->twinkle && s->twinkle_speed > 0.0f)
-		s->twinkle_phase += (double)s->twinkle_speed * (double)seconds;
+	if (c->drift && c->drift_speed != 0.0f)
+		s->drift_px -= (double)c->drift_speed * (double)seconds;
+	if (c->twinkle && c->twinkle_speed > 0.0f)
+		s->twinkle_phase =
+			clat_fmod_pos(s->twinkle_phase + (double)c->twinkle_speed * seconds, CLAT_TWINKLE_PERIOD);
 }
 
 static void csky_draw(struct csky_source *s, uint32_t width, uint32_t height)
 {
-	if (!s->effect || width == 0 || height == 0)
+	const struct cfx_effect *fx = &s->fx;
+	const struct csky_config *c = &s->cfg;
+	if (!fx->effect || width == 0 || height == 0)
 		return;
+	bool twinkle_active = c->twinkle && c->twinkle_speed > 0.0f;
 
-	bool twinkle_active = s->twinkle && s->twinkle_speed > 0.0f;
+	/* Slots are 8.5% of the canvas height wide (see the shader). */
+	double slot_w = 0.085 * (double)height;
+	double slots = floor(s->drift_px / slot_w);
 
-	gs_eparam_t *p;
-	struct vec2 v2;
+	cfx_set_vec2(fx, P_CANVAS_SIZE, (float)width, (float)height);
+	cfx_set_float(fx, P_NOISE_SEED, (float)c->seed);
+	cfx_set_float(fx, P_DRIFT_SLOTS, (float)clat_fmod_pos(slots, CSKY_SLOT_PERIOD));
+	cfx_set_float(fx, P_DRIFT_FRAC_PX, (float)(s->drift_px - slots * slot_w));
+	cfx_set_float(fx, P_HEIGHT_VARIATION, c->height_variation);
+	cfx_set_float(fx, P_MIN_HEIGHT, c->min_height);
+	cfx_set_float(fx, P_WIDTH_VARIATION, c->width_variation);
+	cfx_set_float(fx, P_MIN_WIDTH, c->min_width);
+	cfx_set_float(fx, P_SHADE_VARIATION, c->shade_variation);
+	cfx_set_float(fx, P_WINDOW_OCCUPANCY, c->window_occupancy);
+	cfx_set_vec4(fx, P_BUILDING_COLOR, &c->building_color);
+	cfx_set_vec4(fx, P_WINDOW_ON_COLOR, &c->window_on_color);
+	cfx_set_vec4(fx, P_WINDOW_OFF_COLOR, &c->window_off_color);
+	cfx_set_float(fx, P_TWINKLE_ACTIVE, twinkle_active ? 1.0f : 0.0f);
+	cfx_set_float(fx, P_TWINKLE_PHASE, (float)s->twinkle_phase);
 
-	vec2_set(&v2, (float)width, (float)height);
-	p = gs_effect_get_param_by_name(s->effect, "canvas_size");
-	if (p)
-		gs_effect_set_vec2(p, &v2);
-	p = gs_effect_get_param_by_name(s->effect, "noise_seed");
-	if (p)
-		gs_effect_set_float(p, (float)s->seed);
-	p = gs_effect_get_param_by_name(s->effect, "drift_px");
-	if (p)
-		gs_effect_set_float(p, (float)s->drift_px);
-	p = gs_effect_get_param_by_name(s->effect, "height_variation");
-	if (p)
-		gs_effect_set_float(p, s->height_variation);
-	p = gs_effect_get_param_by_name(s->effect, "min_height");
-	if (p)
-		gs_effect_set_float(p, s->min_height);
-	p = gs_effect_get_param_by_name(s->effect, "width_variation");
-	if (p)
-		gs_effect_set_float(p, s->width_variation);
-	p = gs_effect_get_param_by_name(s->effect, "min_width");
-	if (p)
-		gs_effect_set_float(p, s->min_width);
-	p = gs_effect_get_param_by_name(s->effect, "shade_variation");
-	if (p)
-		gs_effect_set_float(p, s->shade_variation);
-	p = gs_effect_get_param_by_name(s->effect, "window_occupancy");
-	if (p)
-		gs_effect_set_float(p, s->window_occupancy);
-	p = gs_effect_get_param_by_name(s->effect, "building_color");
-	if (p)
-		gs_effect_set_vec4(p, &s->building_color);
-	p = gs_effect_get_param_by_name(s->effect, "window_on_color");
-	if (p)
-		gs_effect_set_vec4(p, &s->window_on_color);
-	p = gs_effect_get_param_by_name(s->effect, "window_off_color");
-	if (p)
-		gs_effect_set_vec4(p, &s->window_off_color);
-	p = gs_effect_get_param_by_name(s->effect, "twinkle_active");
-	if (p)
-		gs_effect_set_float(p, twinkle_active ? 1.0f : 0.0f);
-	p = gs_effect_get_param_by_name(s->effect, "twinkle_phase");
-	if (p)
-		gs_effect_set_float(p, (float)s->twinkle_phase);
-
-	gs_blend_state_push();
-	gs_blend_function(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA);
-	while (gs_effect_loop(s->effect, "Draw"))
+	struct cfx_draw_state st;
+	cfx_draw_begin(&st);
+	while (gs_effect_loop(fx->effect, "Draw"))
 		gs_draw_sprite(NULL, 0, width, height);
-	gs_blend_state_pop();
+	cfx_draw_end(&st);
 }
 
 static void csky_render_cached(struct csky_source *s, uint32_t width, uint32_t height)
 {
-	/* Snapshot the revision before drawing: an update() landing mid-render
-	 * bumps it past this value, so the next frame re-renders with the new
-	 * settings instead of keeping a cache built from a mix of old and new. */
-	long rev = os_atomic_load_long(&s->settings_rev);
-
-	bool animated = (s->drift && s->drift_speed != 0.0f) || (s->twinkle && s->twinkle_speed > 0.0f);
+	const struct csky_config *c = &s->cfg;
+	bool animated = (c->drift && c->drift_speed != 0.0f) || (c->twinkle && c->twinkle_speed > 0.0f);
 	if (animated || !s->cache) {
 		csky_draw(s, width, height);
-		s->cache_rev = rev - 1;
+		s->cache_rev = 0;
 		return;
 	}
 
-	if (s->cache_rev != rev || s->cache_w != width || s->cache_h != height) {
+	if (s->cache_rev != s->cfg_rev || s->cache_w != width || s->cache_h != height) {
 		gs_texrender_reset(s->cache);
 		if (!gs_texrender_begin(s->cache, width, height)) {
 			csky_draw(s, width, height);
 			return;
 		}
-		/* Store raw shader output; the blit re-emits the same values
-		 * under the caller's framebuffer state, so the cached path
-		 * matches the direct draw exactly. */
-		bool prev_srgb = gs_framebuffer_srgb_enabled();
-		gs_enable_framebuffer_srgb(false);
 		struct vec4 clear;
 		vec4_zero(&clear);
 		gs_clear(GS_CLEAR_COLOR, &clear, 0.0f, 0);
 		gs_ortho(0.0f, (float)width, 0.0f, (float)height, -100.0f, 100.0f);
 		csky_draw(s, width, height);
-		gs_enable_framebuffer_srgb(prev_srgb);
 		gs_texrender_end(s->cache);
-		s->cache_rev = rev;
+		s->cache_rev = s->cfg_rev;
 		s->cache_w = width;
 		s->cache_h = height;
 	}
@@ -282,32 +271,29 @@ static void csky_render_cached(struct csky_source *s, uint32_t width, uint32_t h
 		csky_draw(s, width, height);
 		return;
 	}
-
-	/* The cache was composited onto transparent black, so its content is
-	 * premultiplied; blit with the matching blend mode. */
+	/* The cache holds premultiplied linear color, sRGB-encoded like any
+	 * render target; blit it back through its sRGB view. */
 	gs_effect_t *def = obs_get_base_effect(OBS_EFFECT_DEFAULT);
 	gs_eparam_t *img = gs_effect_get_param_by_name(def, "image");
-	if (img)
-		gs_effect_set_texture(img, tex);
-	gs_blend_state_push();
-	gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
+	struct cfx_draw_state st;
+	cfx_draw_begin(&st);
+	gs_effect_set_texture_srgb(img, tex);
 	while (gs_effect_loop(def, "Draw"))
 		gs_draw_sprite(tex, 0, width, height);
-	gs_blend_state_pop();
+	cfx_draw_end(&st);
 }
 
 static void csky_source_render(void *data, gs_effect_t *effect)
 {
 	UNUSED_PARAMETER(effect);
 	struct csky_source *s = data;
-	csky_render_cached(s, s->width, s->height);
+	csky_render_cached(s, s->cfg.width, s->cfg.height);
 }
 
 static void csky_filter_render(void *data, gs_effect_t *effect)
 {
 	UNUSED_PARAMETER(effect);
 	struct csky_source *s = data;
-
 	obs_source_t *target = obs_filter_get_target(s->self);
 	uint32_t w = target ? obs_source_get_base_width(target) : 0;
 	uint32_t h = target ? obs_source_get_base_height(target) : 0;
@@ -315,44 +301,43 @@ static void csky_filter_render(void *data, gs_effect_t *effect)
 		obs_source_skip_video_filter(s->self);
 		return;
 	}
-
-	if (!obs_source_process_filter_begin(s->self, GS_RGBA, OBS_ALLOW_DIRECT_RENDERING))
+	if (!cfx_filter_begin(s->self, OBS_ALLOW_DIRECT_RENDERING))
 		return;
 	obs_source_process_filter_end(s->self, obs_get_base_effect(OBS_EFFECT_DEFAULT), w, h);
-
 	csky_render_cached(s, w, h);
+}
+
+static enum gs_color_space csky_filter_color_space(void *data, size_t count,
+						   const enum gs_color_space *preferred_spaces)
+{
+	UNUSED_PARAMETER(count);
+	UNUSED_PARAMETER(preferred_spaces);
+	struct csky_source *s = data;
+	return cfx_filter_color_space(s->self);
 }
 
 static uint32_t csky_width(void *data)
 {
 	struct csky_source *s = data;
-	return s->width;
+	return (uint32_t)os_atomic_load_long(&s->width);
 }
 
 static uint32_t csky_height(void *data)
 {
 	struct csky_source *s = data;
-	return s->height;
+	return (uint32_t)os_atomic_load_long(&s->height);
 }
 
 static bool csky_drift_modified(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
 {
 	UNUSED_PARAMETER(p);
-	bool drift = obs_data_get_bool(settings, "location_drift");
-	obs_property_t *pp = obs_properties_get(props, "location_drift_speed");
-	if (pp)
-		obs_property_set_visible(pp, drift);
-	return true;
+	return cfx_set_visible(props, "location_drift_speed", obs_data_get_bool(settings, "location_drift"));
 }
 
 static bool csky_twinkle_modified(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
 {
 	UNUSED_PARAMETER(p);
-	bool twinkle = obs_data_get_bool(settings, "window_twinkle");
-	obs_property_t *pp = obs_properties_get(props, "twinkle_speed");
-	if (pp)
-		obs_property_set_visible(pp, twinkle);
-	return true;
+	return cfx_set_visible(props, "twinkle_speed", obs_data_get_bool(settings, "window_twinkle"));
 }
 
 static obs_properties_t *csky_props_common(bool is_filter)
@@ -492,6 +477,7 @@ static struct obs_source_info csky_filter_info = {
 	.update = csky_update,
 	.video_tick = csky_tick,
 	.video_render = csky_filter_render,
+	.video_get_color_space = csky_filter_color_space,
 	.get_properties = csky_filter_props,
 	.get_defaults = csky_filter_defaults,
 };

@@ -8,1063 +8,419 @@ the Free Software Foundation; either version 2 of the License, or
 (at your option) any later version.
 */
 
-#include "pattern-renderer.h"
-#include "svg-image.h"
+#include "pattern-internal.h"
+#include "pattern-media.h"
+#include "common.h"
+#include "lattice.h"
 
-#include <obs-module.h>
 #include <plugin-support.h>
 #include <util/dstr.h>
-#include <util/darray.h>
-#include <util/platform.h>
+#include <util/threading.h>
 #include <math.h>
-#include <stdio.h>
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
+#define MAX_ITEMS CONSTELLATIONS_MAX_ITEMS
+/* Vertex ids must stay exact in float. */
+#define MAX_INSTANCES (16777216u / 6u)
+/* Skip (and log) an item whose quads would cover the canvas this many times
+ * over: huge shapes at the highest densities, where every pixel would be
+ * drawn thousands of times and the GPU could stall. */
+#define MAX_OVERDRAW 2048.0
 
-/* Colors in OBS's 0xAABBGGRR layout. */
-#define CPAT_GOLD 0xFF37AFD4      /* #D4AF37 */
-#define CPAT_CHAMPAGNE 0xFFCEE7F7 /* #F7E7CE */
-#define CPAT_IVORY 0xFFE7F8FF     /* #FFF8E7 */
-#define CPAT_CHARCOAL 0xFF1F1C1C  /* #1C1C1F */
-#define CPAT_NEAR_BLACK 0xFF0C0A0A /* #0A0A0C */
+/* Effect uniforms, in the order of param_names. */
+enum {
+	P_CANVAS_SIZE,
+	P_ORIGIN,
+	P_LATTICE_DIR,
+	P_CELL_SIZE,
+	P_ROW_FIRST,
+	P_COL_COUNT,
+	P_ALONG_MIN,
+	P_ROW_WRAP,
+	P_PERP_FRAC,
+	P_COL_CELLS,
+	P_COL_FRAC,
+	P_COL_PERIOD,
+	P_ALT_LINES,
+	P_BRICK,
+	P_DRIFT_SPEED_AMT,
+	P_DRIFT_SPEED_SEED,
+	P_BORDER_MODE,
+	P_ROW_BOX,
+	P_ROW_RAD,
+	P_ROW_NS,
+	P_ROW_NA,
+	P_ROW_TOTAL,
+	P_ROW_INDEX,
+	P_ROW_PHASE,
+	P_BORDER_ALIGN,
+	P_OFFSET_INWARD,
+	P_RING_MODE,
+	P_ITEM_SEED,
+	P_WANDER_AMT,
+	P_WANDER_TIME,
+	P_TWINKLE_AMOUNT,
+	P_TWINKLE_PHASE,
+	P_AUTO_ROT_ACTIVE,
+	P_AUTO_ROT_PHASE,
+	P_AUTO_ROT_SEED,
+	P_LAYOUT_MODE,
+	P_GRID_RANDOM,
+	P_STEP_INDEX,
+	P_STEP_COUNT,
+	P_SHAPE_KIND,
+	P_POLYGON_SIDES,
+	P_STROKE_THICKNESS,
+	P_OUTLINE_ONLY,
+	P_SHAPE_SIZE,
+	P_SHAPE_ROTATION,
+	P_QUAD_HALF,
+	P_LINE_AXIS,
+	P_SHAPE_COLOR,
+	P_COLOR_VARIATION,
+	P_COLOR_B,
+	P_COLOR_C,
+	P_IMAGE_COLOR_MODE,
+	P_VIGNETTE_ENABLED,
+	P_VIGNETTE_CENTER,
+	P_VIGNETTE_SIZE_PX,
+	P_VIGNETTE_DIRECTION,
+	P_VIGNETTE_SHAPE,
+	P_VIGNETTE_POLYGON_SIDES,
+	P_VIGNETTE_SOFTNESS,
+	P_VIGNETTE_INVERTED,
+	P_BORDER_ACTIVE,
+	P_BORDER_CLIP,
+	P_BORDER_WIDTHS,
+	P_BORDER_RADIUS,
+	P_BORDER_INNER_RADII,
+	P_BORDER_SOFTNESS,
+	P_BG_COLOR,
+	P_BG_COLOR2,
+	P_BG_TYPE,
+	P_BG_DIR,
+	P_SRC_SIZE,
+	P_SRC_RADII,
+	P_CELL_TEXTURE,
+	P_COUNT,
+};
+
+static const char *const param_names[] = {
+	"canvas_size",
+	"origin",
+	"lattice_dir",
+	"cell_size",
+	"row_first",
+	"col_count",
+	"along_min",
+	"row_wrap",
+	"perp_frac",
+	"col_cells",
+	"col_frac",
+	"col_period",
+	"alt_lines",
+	"brick",
+	"drift_speed_amt",
+	"drift_speed_seed",
+	"border_mode",
+	"row_box",
+	"row_rad",
+	"row_ns",
+	"row_na",
+	"row_total",
+	"row_index",
+	"row_phase",
+	"border_align",
+	"offset_inward",
+	"ring_mode",
+	"item_seed",
+	"wander_amt",
+	"wander_time",
+	"twinkle_amount",
+	"twinkle_phase",
+	"auto_rot_active",
+	"auto_rot_phase",
+	"auto_rot_seed",
+	"layout_mode",
+	"grid_random",
+	"step_index",
+	"step_count",
+	"shape_kind",
+	"polygon_sides",
+	"stroke_thickness",
+	"outline_only",
+	"shape_size",
+	"shape_rotation",
+	"quad_half",
+	"line_axis",
+	"shape_color",
+	"color_variation",
+	"color_b",
+	"color_c",
+	"image_color_mode",
+	"vignette_enabled",
+	"vignette_center",
+	"vignette_size_px",
+	"vignette_direction",
+	"vignette_shape",
+	"vignette_polygon_sides",
+	"vignette_softness",
+	"vignette_inverted",
+	"border_active",
+	"border_clip",
+	"border_widths",
+	"border_radius",
+	"border_inner_radii",
+	"border_softness",
+	"bg_color",
+	"bg_color2",
+	"bg_type",
+	"bg_dir",
+	"src_size",
+	"src_radii",
+	"cell_texture",
+};
+_Static_assert(OBS_COUNTOF(param_names) == P_COUNT, "param_names must list every P_ uniform");
 
 /* Built-in SVGs shipped in data/images/<id>.svg. */
-static const char *const cpat_image_presets[][2] = {
-	{"sparkle", "Constellations.Item.ImagePreset.Sparkle"},
-	{"star4", "Constellations.Item.ImagePreset.Star4"},
-	{"moon", "Constellations.Item.ImagePreset.Moon"},
-	{"planet", "Constellations.Item.ImagePreset.Planet"},
-	{"snowflake", "Constellations.Item.ImagePreset.Snowflake"},
-	{"comet", "Constellations.Item.ImagePreset.Comet"},
+static const char *const preset_ids[] = {"sparkle", "star4", "moon", "planet", "snowflake", "comet"};
+
+struct cpat_item_cfg {
+	bool enabled;
+	int kind;
+	int shape;
+	float polygon_sides;
+	float stroke_thickness;
+	bool outline_only;
+	struct vec4 color; /* linear */
+
+	int image_color_mode;
+	struct vec4 image_tint; /* linear */
+	float image_opacity;
+	bool keep_aspect;
+	bool random_colors;
+	struct vec4 color_b, color_c; /* linear */
+
+	/* Image items: what the texture should hold, and the decoded pixels
+	 * when that changed since the last configuration (NULL otherwise). */
+	char *media_key;
+	struct cpat_pixels *pixels;
+
+	/* Source items: a UUID, or a name for settings saved before UUIDs. */
+	char *source_uuid;
+	char *source_name;
+
+	float size;
+	float rotation_deg;
+	float offset_x, offset_y;
+	float density;
+
+	int twinkle_mode;
+	float twinkle_amount, twinkle_speed;
+	int speed_drift_mode;
+	float speed_drift_amount;
+	int autorot_mode;
+	float autorot_speed;
+	int autorot_style;
+	float autorot_seed;
 };
 
-static void cpat_item_release_source(struct cpat_item *it)
-{
-	if (it->source_ref) {
-		obs_weak_source_release(it->source_ref);
-		it->source_ref = NULL;
-	}
-	if (it->source_texrender) {
-		obs_enter_graphics();
-		gs_texrender_destroy(it->source_texrender);
-		obs_leave_graphics();
-		it->source_texrender = NULL;
-	}
-}
+struct cpat_config {
+	uint32_t width, height;
+	int background_type;
+	struct vec4 background_color, background_color2; /* sRGB-encoded */
+	float background_angle_deg;
+	bool has_background;
+	float anchor_x_pct, anchor_y_pct;
+	float canvas_rotation_deg;
 
-static void cpat_item_release_image(struct cpat_item *it)
+	uint32_t item_count;
+	struct cpat_item_cfg items[MAX_ITEMS];
+	int layout_mode, grid_order;
+
+	float motion_angle_deg, motion_speed;
+	bool alternating_lines;
+	bool speed_drift;
+	float speed_drift_amount;
+	bool location_drift;
+	float location_drift_amount;
+
+	bool twinkle_enabled;
+	float twinkle_amount, twinkle_speed;
+
+	bool autorot_enabled;
+	float autorot_speed;
+	int autorot_style;
+	float autorot_seed;
+
+	bool vignette_enabled;
+	float vignette_size;
+	float vignette_anchor_x_pct, vignette_anchor_y_pct;
+	float vignette_direction_deg;
+	int vignette_shape;
+	float vignette_polygon_sides;
+	float vignette_softness;
+	bool vignette_inverted;
+
+	struct cpat_border border;
+};
+
+/* Graphics-thread state of one item. */
+struct cpat_gpu_item {
+	char *media_key;
+	gs_texture_t *texture;
+
+	char *source_uuid;
+	char *source_name;
+	obs_weak_source_t *source;
+	gs_texrender_t *texrender;
+	gs_texture_t *frame_texture; /* the source's image this frame */
+	bool shown, activated;       /* refs we hold on the source */
+	bool cycle_warned;
+	float resolve_wait;
+
+	double twinkle_phase; /* cycles */
+	double autorot_phase; /* radians */
+};
+
+struct cpat_renderer {
+	obs_source_t *owner;
+	enum cpat_host host;
+	struct cfx_effect fx;
+
+	/* UI side. update() is serialized by update_mutex; it caches parsed
+	 * SVGs (to re-rasterize on resize) and the media keys it last
+	 * submitted, so unchanged artwork is never decoded twice. */
+	pthread_mutex_t update_mutex;
+	struct {
+		char *path;
+		struct NSVGimage *svg;
+	} svg_cache[MAX_ITEMS];
+	char *submitted_keys[MAX_ITEMS];
+
+	/* Hand-off from update() to tick(). */
+	pthread_mutex_t pending_mutex;
+	struct cpat_config *pending;
+
+	volatile long width, height;
+	volatile long reset_motion;
+
+	/* Graphics thread only. */
+	struct cpat_config *cfg;
+	struct cpat_gpu_item gpu[MAX_ITEMS];
+	bool showing, active;
+	bool rendering_sources;
+	double motion_along, motion_perp;
+	double border_march;
+	double wander_time;
+	uint64_t overdraw_warned;
+};
+
+/* ------------------------------------------------------------ settings */
+
+static char *preset_path(const char *preset)
 {
-	if (it->svg) {
-		if (it->svg_texture) {
-			obs_enter_graphics();
-			gs_texture_destroy(it->svg_texture);
-			obs_leave_graphics();
-			it->svg_texture = NULL;
+	for (size_t i = 0; i < OBS_COUNTOF(preset_ids); ++i) {
+		if (strcmp(preset, preset_ids[i]) == 0) {
+			struct dstr rel = {0};
+			dstr_printf(&rel, "images/%s.svg", preset);
+			char *path = obs_module_file(rel.array);
+			dstr_free(&rel);
+			return path;
 		}
-		it->svg_px = 0;
-		cpat_svg_free(it->svg);
-		it->svg = NULL;
-		it->image_loaded = false;
-	} else if (it->image_loaded) {
-		obs_enter_graphics();
-		gs_image_file_ex_free(&it->image);
-		obs_leave_graphics();
-		it->image_loaded = false;
 	}
+	return NULL;
 }
 
-/* Rasterizes the item's SVG at its current size. The pixel size is rounded
- * up to a multiple of 32 so dragging the size slider only re-rasterizes
- * every few steps instead of on every tick. */
-static void cpat_item_refresh_svg(struct cpat_item *it)
+static void item_cfg_free(struct cpat_item_cfg *it)
 {
-	if (!it->svg)
-		return;
-	uint32_t px = ((uint32_t)ceilf(it->size) + 31u) & ~31u;
-	if (px < 32)
-		px = 32;
-	if (px > 2048)
-		px = 2048;
-	if (px == it->svg_px && it->svg_texture)
-		return;
-	uint8_t *data = cpat_svg_rasterize(it->svg, px);
-	if (!data)
-		return;
-	const uint8_t *planes[] = {data};
-	obs_enter_graphics();
-	if (it->svg_texture)
-		gs_texture_destroy(it->svg_texture);
-	it->svg_texture = gs_texture_create(px, px, GS_RGBA, 1, planes, 0);
-	obs_leave_graphics();
-	bfree(data);
-	it->svg_px = it->svg_texture ? px : 0;
-}
-
-static gs_texture_t *cpat_item_image_texture(struct cpat_item *it)
-{
-	if (!it->image_loaded)
-		return NULL;
-	return it->svg ? it->svg_texture : it->image.texture;
-}
-
-static void cpat_item_acquire_image(struct cpat_item *it)
-{
-	cpat_item_release_image(it);
-	if (!it->image_path || !*it->image_path)
-		return;
-	if (cpat_svg_is_svg_path(it->image_path)) {
-		it->svg = cpat_svg_load(it->image_path);
-		it->image_loaded = it->svg != NULL;
-		cpat_item_refresh_svg(it);
-		return;
-	}
-	gs_image_file_ex_init(&it->image, it->image_path, GS_IMAGE_ALPHA_STRAIGHT);
-	obs_enter_graphics();
-	gs_image_file_ex_init_texture(&it->image);
-	obs_leave_graphics();
-	it->image_loaded = it->image.loaded;
-}
-
-static void cpat_item_acquire_source(struct cpat_item *it, obs_source_t *exclude)
-{
-	cpat_item_release_source(it);
-	if (!it->source_name || !*it->source_name)
-		return;
-	obs_source_t *src = obs_get_source_by_name(it->source_name);
-	if (!src)
-		return;
-	if (src == exclude) {
-		obs_source_release(src);
-		return;
-	}
-	it->source_ref = obs_source_get_weak_source(src);
-	obs_source_release(src);
-
-	obs_enter_graphics();
-	it->source_texrender = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
-	obs_leave_graphics();
-}
-
-static void cpat_item_clear(struct cpat_item *it)
-{
-	cpat_item_release_image(it);
-	cpat_item_release_source(it);
-	bfree(it->image_path);
+	bfree(it->media_key);
+	bfree(it->source_uuid);
 	bfree(it->source_name);
-	memset(it, 0, sizeof(*it));
+	cpat_pixels_free(it->pixels);
 }
 
-void cpat_renderer_init(struct cpat_renderer *r, obs_source_t *owner, enum cpat_host host)
+static void config_free(struct cpat_config *cfg)
 {
-	memset(r, 0, sizeof(*r));
-	r->owner = owner;
-	r->host = host;
-
-	char *path = obs_module_file("effects/pattern.effect");
-	if (!path) {
-		obs_log(LOG_ERROR, "Constellations: pattern.effect not found");
+	if (!cfg)
 		return;
-	}
-	obs_enter_graphics();
-	char *errors = NULL;
-	r->effect = gs_effect_create_from_file(path, &errors);
-	obs_leave_graphics();
-	if (!r->effect)
-		obs_log(LOG_ERROR, "Constellations: failed to compile pattern.effect: %s",
-			errors ? errors : "(no detail)");
-	bfree(errors);
-	bfree(path);
+	for (int i = 0; i < MAX_ITEMS; ++i)
+		item_cfg_free(&cfg->items[i]);
+	bfree(cfg);
 }
 
-void cpat_renderer_free(struct cpat_renderer *r)
+void cpat_border_read_settings(obs_data_t *settings, struct cpat_border *b)
 {
-	for (int i = 0; i < CONSTELLATIONS_MAX_ITEMS; ++i)
-		cpat_item_clear(&r->items[i]);
-	if (r->effect) {
-		obs_enter_graphics();
-		gs_effect_destroy(r->effect);
-		obs_leave_graphics();
-		r->effect = NULL;
-	}
-}
-
-void cpat_renderer_set_defaults(obs_data_t *settings, enum cpat_host host)
-{
-	const bool include_canvas = host == CPAT_HOST_SOURCE;
-	const bool border = host == CPAT_HOST_BORDER;
-	if (include_canvas) {
-		obs_data_set_default_int(settings, "width", 1920);
-		obs_data_set_default_int(settings, "height", 1080);
-		/* Charcoal center fading to near-black corners. */
-		obs_data_set_default_int(settings, "background_type", CBG_RADIAL);
-		obs_data_set_default_int(settings, "background_color", CPAT_CHARCOAL);
-		obs_data_set_default_int(settings, "background_color2", CPAT_NEAR_BLACK);
-	} else if (border) {
-		/* A solid charcoal frame. */
-		obs_data_set_default_int(settings, "background_type", CBG_SOLID);
-		obs_data_set_default_int(settings, "background_color", CPAT_CHARCOAL);
-		obs_data_set_default_int(settings, "background_color2", CPAT_NEAR_BLACK);
+	b->active = true;
+	b->position = (int)obs_data_get_int(settings, "border_position");
+	b->round_source = obs_data_get_bool(settings, "border_round_source");
+	b->layout = (int)obs_data_get_int(settings, "border_layout");
+	if (obs_data_get_bool(settings, "border_per_side")) {
+		b->left = (float)obs_data_get_int(settings, "border_left");
+		b->top = (float)obs_data_get_int(settings, "border_top");
+		b->right = (float)obs_data_get_int(settings, "border_right");
+		b->bottom = (float)obs_data_get_int(settings, "border_bottom");
 	} else {
-		obs_data_set_default_int(settings, "background_type", CBG_SOLID);
-		obs_data_set_default_int(settings, "background_color", 0x00000000);
-		obs_data_set_default_int(settings, "background_color2", 0x00000000);
+		float w = (float)obs_data_get_int(settings, "border_width");
+		b->left = b->top = b->right = b->bottom = w;
 	}
-	obs_data_set_default_double(settings, "background_angle", 90.0);
-	obs_data_set_default_double(settings, "anchor_x_pct", 50.0);
-	obs_data_set_default_double(settings, "anchor_y_pct", 50.0);
-	obs_data_set_default_double(settings, "canvas_rotation", 0.0);
-	obs_data_set_default_int(settings, "item_count", 1);
-	obs_data_set_default_int(settings, "layout_mode", CLAYOUT_LAYERED);
-	obs_data_set_default_int(settings, "grid_order", CGRID_RANDOM);
-
-	/* The standalone source starts as slowly drifting, twinkling gold stars
-	 * on charcoal; the filter keeps plain white dots over the video; the
-	 * border is a still row of gold stars around a charcoal frame. */
-	const bool gold_stars = include_canvas || border;
-	const int default_shape = gold_stars ? CSHAPE_STAR : CSHAPE_CIRCLE;
-	const long long default_color = gold_stars ? CPAT_GOLD : 0xFFFFFFFF;
-	const double default_size = border ? 20.0 : 24.0;
-	const double default_density = border ? 3.0 : 2.0;
-
-	for (int i = 0; i < CONSTELLATIONS_MAX_ITEMS; ++i) {
-		char key[64];
-#define DK(name) (snprintf(key, sizeof(key), "item_%d_%s", i + 1, name), key)
-		obs_data_set_default_bool(settings, DK("enabled"), i == 0);
-		obs_data_set_default_int(settings, DK("kind"), CITEM_SHAPE);
-		obs_data_set_default_int(settings, DK("shape"), default_shape);
-		obs_data_set_default_int(settings, DK("polygon_sides"), 6);
-		obs_data_set_default_double(settings, DK("stroke_thickness"), 0.2);
-		obs_data_set_default_bool(settings, DK("outline_only"), false);
-		obs_data_set_default_int(settings, DK("color"), default_color);
-		obs_data_set_default_string(settings, DK("image_preset"), "");
-		obs_data_set_default_string(settings, DK("image_path"), "");
-		obs_data_set_default_bool(settings, DK("keep_aspect"), true);
-		obs_data_set_default_bool(settings, DK("random_colors"), false);
-		obs_data_set_default_int(settings, DK("color_b"), CPAT_CHAMPAGNE);
-		obs_data_set_default_int(settings, DK("color_c"), CPAT_IVORY);
-		obs_data_set_default_int(settings, DK("image_color_mode"), CIMGCOLOR_ORIGINAL);
-		obs_data_set_default_int(settings, DK("image_tint"), CPAT_GOLD);
-		obs_data_set_default_double(settings, DK("image_opacity"), 100.0);
-		obs_data_set_default_string(settings, DK("source_name"), "");
-		obs_data_set_default_double(settings, DK("size"), default_size);
-		obs_data_set_default_double(settings, DK("rotation"), 0.0);
-		obs_data_set_default_double(settings, DK("offset_x"), 0.0);
-		obs_data_set_default_double(settings, DK("offset_y"), 0.0);
-		obs_data_set_default_double(settings, DK("density"), default_density);
-		obs_data_set_default_int(settings, DK("twinkle_mode"), CTWINKLE_GLOBAL);
-		obs_data_set_default_double(settings, DK("twinkle_amount"), 0.5);
-		obs_data_set_default_double(settings, DK("twinkle_speed"), 1.0);
-		obs_data_set_default_int(settings, DK("speed_drift_mode"), CSDRIFT_GLOBAL);
-		obs_data_set_default_double(settings, DK("speed_drift_amount"), 0.25);
-		obs_data_set_default_int(settings, DK("autorot_mode"), CAROT_GLOBAL);
-		obs_data_set_default_double(settings, DK("autorot_speed"), 45.0);
-		obs_data_set_default_int(settings, DK("autorot_style"), CAROT_STYLE_RANDOM);
-		obs_data_set_default_int(settings, DK("autorot_seed"), 0);
-#undef DK
-	}
-
-	obs_data_set_default_double(settings, "motion_angle", include_canvas ? 315.0 : 0.0);
-	obs_data_set_default_double(settings, "motion_speed", include_canvas ? 12.0 : 0.0);
-	obs_data_set_default_bool(settings, "alternating_lines", false);
-	obs_data_set_default_bool(settings, "speed_drift", false);
-	obs_data_set_default_double(settings, "speed_drift_amount", 0.25);
-	obs_data_set_default_bool(settings, "location_drift", false);
-	obs_data_set_default_double(settings, "location_drift_amount", 0.15);
-
-	obs_data_set_default_bool(settings, "twinkle_enabled", include_canvas);
-	obs_data_set_default_double(settings, "twinkle_amount", include_canvas ? 0.3 : 0.5);
-	obs_data_set_default_double(settings, "twinkle_speed", include_canvas ? 0.5 : 1.0);
-
-	obs_data_set_default_bool(settings, "autorot_enabled", false);
-	obs_data_set_default_double(settings, "autorot_speed", 45.0);
-	obs_data_set_default_int(settings, "autorot_style", CAROT_STYLE_RANDOM);
-	obs_data_set_default_int(settings, "autorot_seed", 0);
-
-	obs_data_set_default_bool(settings, "vignette_enabled", false);
-	obs_data_set_default_double(settings, "vignette_size", 0.7);
-	obs_data_set_default_double(settings, "vignette_anchor_x_pct", 50.0);
-	obs_data_set_default_double(settings, "vignette_anchor_y_pct", 50.0);
-	obs_data_set_default_double(settings, "vignette_direction", 0.0);
-	obs_data_set_default_int(settings, "vignette_shape", CVIGN_CIRCLE);
-	obs_data_set_default_int(settings, "vignette_polygon_sides", 6);
-	obs_data_set_default_double(settings, "vignette_softness", 0.35);
-	obs_data_set_default_bool(settings, "vignette_inverted", false);
+	b->radius = (float)obs_data_get_int(settings, "border_radius");
+	b->softness = (float)obs_data_get_int(settings, "border_softness");
+	b->clip = obs_data_get_bool(settings, "border_clip");
+	b->rows = (int)obs_data_get_int(settings, "border_rows");
+	if (b->rows < 1)
+		b->rows = 1;
+	if (b->rows > 8)
+		b->rows = 8;
+	b->stagger_rows = obs_data_get_bool(settings, "border_stagger");
+	b->align = (int)obs_data_get_int(settings, "border_orientation") == CBORDER_ORIENT_FOLLOW_EDGE;
 }
 
-struct enum_src_ctx {
-	obs_property_t *list;
-	DARRAY(const char *) names;
-	obs_source_t *self;
-};
-
-static bool enum_collect_source(void *data, obs_source_t *src)
+void cpat_border_corner_radii(const struct cpat_border *b, uint32_t w, uint32_t h, struct vec4 *outer,
+			      struct vec4 *inner)
 {
-	struct enum_src_ctx *ctx = data;
-	if (src == ctx->self)
-		return true;
-	uint32_t flags = obs_source_get_output_flags(src);
-	if ((flags & OBS_SOURCE_VIDEO) == 0)
-		return true;
-	enum obs_source_type type = obs_source_get_type(src);
-	if (type == OBS_SOURCE_TYPE_TRANSITION)
-		return true;
-	const char *name = obs_source_get_name(src);
-	if (!name)
-		return true;
-	da_push_back(ctx->names, &name);
-	return true;
+	const float widths[4] = {b->left, b->top, b->right, b->bottom};
+	float rc, in[4];
+	clat_border_radii((float)w, (float)h, widths, b->radius, &rc, in);
+	vec4_set(outer, rc, rc, rc, rc);
+	vec4_set(inner, in[0], in[1], in[2], in[3]);
 }
 
-static int compare_strs_ci(const void *a, const void *b)
-{
-	const char *const *sa = a;
-	const char *const *sb = b;
-	return astrcmpi(*sa, *sb);
-}
-
-static void fill_source_dropdown(obs_property_t *list, obs_source_t *self_source)
-{
-	obs_property_list_clear(list);
-	obs_property_list_add_string(list, obs_module_text("Constellations.Source.None"), "");
-	struct enum_src_ctx ctx = {0};
-	ctx.list = list;
-	ctx.self = self_source;
-	da_init(ctx.names);
-	obs_enum_sources(enum_collect_source, &ctx);
-	qsort(ctx.names.array, ctx.names.num, sizeof(char *), compare_strs_ci);
-	for (size_t i = 0; i < ctx.names.num; ++i)
-		obs_property_list_add_string(list, ctx.names.array[i], ctx.names.array[i]);
-	da_free(ctx.names);
-}
-
-static int item_index_from_prop(obs_property_t *p)
-{
-	const char *name = obs_property_name(p);
-	if (!name)
-		return -1;
-	int n = 0;
-	if (sscanf(name, "item_%d_", &n) != 1)
-		return -1;
-	return n - 1;
-}
-
-static void apply_item_kind_visibility(obs_properties_t *props, obs_data_t *settings, int i)
+static void read_item(struct cpat_item_cfg *it, obs_data_t *settings, int i)
 {
 	char key[64];
-	snprintf(key, sizeof(key), "item_%d_kind", i + 1);
-	int kind = (int)obs_data_get_int(settings, key);
-	snprintf(key, sizeof(key), "item_%d_shape", i + 1);
-	int shape_v = (int)obs_data_get_int(settings, key);
-	snprintf(key, sizeof(key), "item_%d_outline_only", i + 1);
-	bool outline = obs_data_get_bool(settings, key);
-
-#define VIS(name_, on)                                                \
-	do {                                                          \
-		snprintf(key, sizeof(key), "item_%d_%s", i + 1, name_); \
-		obs_property_t *_pp = obs_properties_get(props, key); \
-		if (_pp)                                              \
-			obs_property_set_visible(_pp, on);            \
-	} while (0)
-
-	VIS("shape", kind == CITEM_SHAPE);
-	VIS("outline_only", kind == CITEM_SHAPE);
-	VIS("polygon_sides", kind == CITEM_SHAPE && shape_v == CSHAPE_POLYGON);
-	VIS("stroke_thickness", kind == CITEM_SHAPE && (shape_v == CSHAPE_CROSS || outline));
-	VIS("color", kind == CITEM_SHAPE);
-	snprintf(key, sizeof(key), "item_%d_image_preset", i + 1);
-	bool custom_file = !*obs_data_get_string(settings, key);
-	VIS("image_preset", kind == CITEM_IMAGE);
-	VIS("image_path", kind == CITEM_IMAGE && custom_file);
-	VIS("source_name", kind == CITEM_SOURCE);
-	bool textured = kind == CITEM_IMAGE || kind == CITEM_SOURCE;
-	snprintf(key, sizeof(key), "item_%d_image_color_mode", i + 1);
-	bool tinted = (int)obs_data_get_int(settings, key) != CIMGCOLOR_ORIGINAL;
-	VIS("image_color_mode", textured);
-	VIS("image_tint", textured && tinted);
-	VIS("image_opacity", textured);
-	VIS("keep_aspect", textured);
-	/* Random colors replace the shape color or the image tint, so they
-	 * mean nothing for an image shown in its original colors. */
-	bool colorable = kind == CITEM_SHAPE || (textured && tinted);
-	snprintf(key, sizeof(key), "item_%d_random_colors", i + 1);
-	bool random = obs_data_get_bool(settings, key);
-	VIS("random_colors", colorable);
-	VIS("color_b", colorable && random);
-	VIS("color_c", colorable && random);
-#undef VIS
-}
-
-static void apply_item_twinkle_visibility(obs_properties_t *props, obs_data_t *settings, int i)
-{
-	char key[64];
-	snprintf(key, sizeof(key), "item_%d_twinkle_mode", i + 1);
-	bool custom = (int)obs_data_get_int(settings, key) == CTWINKLE_CUSTOM;
-	snprintf(key, sizeof(key), "item_%d_enabled", i + 1);
-	bool en = obs_data_get_bool(settings, key);
-	const char *names[] = {"twinkle_amount", "twinkle_speed"};
-	for (size_t k = 0; k < sizeof(names) / sizeof(names[0]); ++k) {
-		snprintf(key, sizeof(key), "item_%d_%s", i + 1, names[k]);
-		obs_property_t *pp = obs_properties_get(props, key);
-		if (pp)
-			obs_property_set_visible(pp, en && custom);
-	}
-}
-
-static void apply_item_speed_drift_visibility(obs_properties_t *props, obs_data_t *settings, int i)
-{
-	char key[64];
-	snprintf(key, sizeof(key), "item_%d_speed_drift_mode", i + 1);
-	bool custom = (int)obs_data_get_int(settings, key) == CSDRIFT_CUSTOM;
-	snprintf(key, sizeof(key), "item_%d_enabled", i + 1);
-	bool en = obs_data_get_bool(settings, key);
-	snprintf(key, sizeof(key), "item_%d_speed_drift_amount", i + 1);
-	obs_property_t *pp = obs_properties_get(props, key);
-	if (pp)
-		obs_property_set_visible(pp, en && custom);
-}
-
-static void apply_item_autorot_visibility(obs_properties_t *props, obs_data_t *settings, int i)
-{
-	char key[64];
-	snprintf(key, sizeof(key), "item_%d_autorot_mode", i + 1);
-	bool custom = (int)obs_data_get_int(settings, key) == CAROT_CUSTOM;
-	snprintf(key, sizeof(key), "item_%d_autorot_style", i + 1);
-	bool unison = (int)obs_data_get_int(settings, key) == CAROT_STYLE_UNISON;
-	snprintf(key, sizeof(key), "item_%d_enabled", i + 1);
-	bool en = obs_data_get_bool(settings, key);
-	obs_property_t *pp;
-	snprintf(key, sizeof(key), "item_%d_autorot_style", i + 1);
-	pp = obs_properties_get(props, key);
-	if (pp)
-		obs_property_set_visible(pp, en && custom);
-	snprintf(key, sizeof(key), "item_%d_autorot_speed", i + 1);
-	pp = obs_properties_get(props, key);
-	if (pp)
-		obs_property_set_visible(pp, en && custom && unison);
-	snprintf(key, sizeof(key), "item_%d_autorot_seed", i + 1);
-	pp = obs_properties_get(props, key);
-	if (pp)
-		obs_property_set_visible(pp, en && custom);
-}
-
-static void apply_item_enabled_visibility(obs_properties_t *props, obs_data_t *settings, int i)
-{
-	char key[64];
-	snprintf(key, sizeof(key), "item_%d_enabled", i + 1);
-	bool en = obs_data_get_bool(settings, key);
-	const char *names[] = {"kind",       "shape",         "outline_only",     "polygon_sides", "stroke_thickness",
-			       "color",      "image_preset",  "image_path",       "source_name",   "image_color_mode",
-			       "image_tint", "image_opacity", "keep_aspect",      "random_colors", "color_b",
-			       "color_c",    "size",          "rotation",         "offset_x",      "offset_y",
-			       "density",    "twinkle_mode",  "speed_drift_mode", "autorot_mode"};
-	for (size_t k = 0; k < sizeof(names) / sizeof(names[0]); ++k) {
-		snprintf(key, sizeof(key), "item_%d_%s", i + 1, names[k]);
-		obs_property_t *pp = obs_properties_get(props, key);
-		if (pp)
-			obs_property_set_visible(pp, en);
-	}
-	if (en)
-		apply_item_kind_visibility(props, settings, i);
-	apply_item_twinkle_visibility(props, settings, i);
-	apply_item_speed_drift_visibility(props, settings, i);
-	apply_item_autorot_visibility(props, settings, i);
-}
-
-static void apply_item_count_visibility(obs_properties_t *props, obs_data_t *settings)
-{
-	int count = (int)obs_data_get_int(settings, "item_count");
-	if (count < 1)
-		count = 1;
-	if (count > CONSTELLATIONS_MAX_ITEMS)
-		count = CONSTELLATIONS_MAX_ITEMS;
-	char gid[64];
-	for (int i = 0; i < CONSTELLATIONS_MAX_ITEMS; ++i) {
-		snprintf(gid, sizeof(gid), "item_%d_group", i + 1);
-		obs_property_t *gp = obs_properties_get(props, gid);
-		if (gp)
-			obs_property_set_visible(gp, i < count);
-	}
-}
-
-static void apply_density_visibility(obs_properties_t *props, obs_data_t *settings)
-{
-	int mode = (int)obs_data_get_int(settings, "layout_mode");
-	char key[64];
-	int first_enabled = -1;
-	for (int i = 0; i < CONSTELLATIONS_MAX_ITEMS; i++) {
-		snprintf(key, sizeof(key), "item_%d_enabled", i + 1);
-		if (obs_data_get_bool(settings, key)) {
-			first_enabled = i;
-			break;
-		}
-	}
-	for (int i = 0; i < CONSTELLATIONS_MAX_ITEMS; i++) {
-		snprintf(key, sizeof(key), "item_%d_enabled", i + 1);
-		bool en = obs_data_get_bool(settings, key);
-		snprintf(key, sizeof(key), "item_%d_density", i + 1);
-		obs_property_t *dp = obs_properties_get(props, key);
-		if (!dp)
-			continue;
-		bool show = en;
-		if (mode == CLAYOUT_STEP_REPEAT || mode == CLAYOUT_GRID)
-			show = en && (i == first_enabled);
-		obs_property_set_visible(dp, show);
-	}
-}
-
-static void apply_motion_visibility(obs_properties_t *props, obs_data_t *settings)
-{
-	/* Never gate visibility on motion_speed: toggling rows while the user
-	 * drags the slider through zero makes the whole dialog jitter. */
-	bool sd = obs_data_get_bool(settings, "speed_drift");
-	bool ld = obs_data_get_bool(settings, "location_drift");
-	obs_property_t *pp;
-	pp = obs_properties_get(props, "speed_drift_amount");
-	if (pp)
-		obs_property_set_visible(pp, sd);
-	pp = obs_properties_get(props, "location_drift_amount");
-	if (pp)
-		obs_property_set_visible(pp, ld);
-}
-
-static void apply_vignette_visibility(obs_properties_t *props, obs_data_t *settings)
-{
-	bool en = obs_data_get_bool(settings, "vignette_enabled");
-	int shape = (int)obs_data_get_int(settings, "vignette_shape");
-	const char *names[] = {"vignette_size",      "vignette_anchor_x_pct", "vignette_anchor_y_pct",
-			       "vignette_direction", "vignette_shape",        "vignette_polygon_sides",
-			       "vignette_softness",  "vignette_inverted"};
-	for (size_t k = 0; k < sizeof(names) / sizeof(names[0]); k++) {
-		obs_property_t *pp = obs_properties_get(props, names[k]);
-		if (pp)
-			obs_property_set_visible(pp, en);
-	}
-	if (en) {
-		obs_property_t *pp = obs_properties_get(props, "vignette_polygon_sides");
-		if (pp)
-			obs_property_set_visible(pp, shape == CVIGN_POLYGON);
-		pp = obs_properties_get(props, "vignette_direction");
-		if (pp)
-			obs_property_set_visible(pp, shape != CVIGN_CIRCLE);
-	}
-}
-
-static bool background_type_modified(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
-{
-	UNUSED_PARAMETER(p);
-	int type = (int)obs_data_get_int(settings, "background_type");
-	obs_property_t *pp = obs_properties_get(props, "background_color");
-	if (pp)
-		obs_property_set_visible(pp, type != CBG_NONE);
-	pp = obs_properties_get(props, "background_color2");
-	if (pp)
-		obs_property_set_visible(pp, type != CBG_SOLID && type != CBG_NONE);
-	pp = obs_properties_get(props, "background_angle");
-	if (pp)
-		obs_property_set_visible(pp, type == CBG_LINEAR);
-	return true;
-}
-
-static void add_background_props(obs_properties_t *grp, bool allow_none)
-{
-	obs_property_t *bt = obs_properties_add_list(grp, "background_type",
-						     obs_module_text("Constellations.Background.Type"),
-						     OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	if (allow_none)
-		obs_property_list_add_int(bt, obs_module_text("Constellations.Background.Type.None"), CBG_NONE);
-	obs_property_list_add_int(bt, obs_module_text("Constellations.Background.Type.Solid"), CBG_SOLID);
-	obs_property_list_add_int(bt, obs_module_text("Constellations.Background.Type.Radial"), CBG_RADIAL);
-	obs_property_list_add_int(bt, obs_module_text("Constellations.Background.Type.Linear"), CBG_LINEAR);
-	obs_property_set_modified_callback(bt, background_type_modified);
-	obs_properties_add_color_alpha(grp, "background_color",
-				       obs_module_text("Constellations.Canvas.BackgroundColor"));
-	obs_properties_add_color_alpha(grp, "background_color2", obs_module_text("Constellations.Background.Color2"));
-	obs_properties_add_float_slider(grp, "background_angle", obs_module_text("Constellations.Background.Angle"),
-					0.0, 360.0, 1.0);
-}
-
-static bool item_count_modified(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
-{
-	UNUSED_PARAMETER(p);
-	apply_item_count_visibility(props, settings);
-	apply_density_visibility(props, settings);
-	return true;
-}
-
-static bool layout_mode_modified(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
-{
-	UNUSED_PARAMETER(p);
-	apply_density_visibility(props, settings);
-	int mode = (int)obs_data_get_int(settings, "layout_mode");
-	obs_property_t *go = obs_properties_get(props, "grid_order");
-	if (go)
-		obs_property_set_visible(go, mode == CLAYOUT_GRID);
-	return true;
-}
-
-static bool motion_reset_clicked(obs_properties_t *props, obs_property_t *p, void *data)
-{
-	UNUSED_PARAMETER(props);
-	UNUSED_PARAMETER(p);
-	struct cpat_renderer *r = data;
-	if (!r)
-		return false;
-	r->motion_off_along = 0.0;
-	r->motion_off_perp = 0.0;
-	r->border_march = 0.0;
-	return false;
-}
-
-static bool twinkle_modified(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
-{
-	UNUSED_PARAMETER(p);
-	bool en = obs_data_get_bool(settings, "twinkle_enabled");
-	obs_property_t *pp;
-	pp = obs_properties_get(props, "twinkle_amount");
-	if (pp)
-		obs_property_set_visible(pp, en);
-	pp = obs_properties_get(props, "twinkle_speed");
-	if (pp)
-		obs_property_set_visible(pp, en);
-	return true;
-}
-
-static bool autorot_modified(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
-{
-	UNUSED_PARAMETER(p);
-	bool en = obs_data_get_bool(settings, "autorot_enabled");
-	bool unison = (int)obs_data_get_int(settings, "autorot_style") == CAROT_STYLE_UNISON;
-	obs_property_t *pp;
-	pp = obs_properties_get(props, "autorot_style");
-	if (pp)
-		obs_property_set_visible(pp, en);
-	pp = obs_properties_get(props, "autorot_speed");
-	if (pp)
-		obs_property_set_visible(pp, en && unison);
-	pp = obs_properties_get(props, "autorot_seed");
-	if (pp)
-		obs_property_set_visible(pp, en);
-	return true;
-}
-
-static bool motion_modified(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
-{
-	UNUSED_PARAMETER(p);
-	apply_motion_visibility(props, settings);
-	return true;
-}
-
-static bool vignette_modified(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
-{
-	UNUSED_PARAMETER(p);
-	apply_vignette_visibility(props, settings);
-	return true;
-}
-
-static bool item_kind_modified(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
-{
-	int i = item_index_from_prop(p);
-	if (i < 0)
-		return false;
-	apply_item_kind_visibility(props, settings, i);
-	return true;
-}
-
-static bool item_twinkle_modified(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
-{
-	int i = item_index_from_prop(p);
-	if (i < 0)
-		return false;
-	apply_item_twinkle_visibility(props, settings, i);
-	return true;
-}
-
-static bool item_speed_drift_modified(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
-{
-	int i = item_index_from_prop(p);
-	if (i < 0)
-		return false;
-	apply_item_speed_drift_visibility(props, settings, i);
-	return true;
-}
-
-static bool item_autorot_modified(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
-{
-	int i = item_index_from_prop(p);
-	if (i < 0)
-		return false;
-	apply_item_autorot_visibility(props, settings, i);
-	return true;
-}
-
-static bool item_enabled_modified(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
-{
-	int i = item_index_from_prop(p);
-	if (i < 0)
-		return false;
-	apply_item_enabled_visibility(props, settings, i);
-	apply_density_visibility(props, settings);
-	return true;
-}
-
-static void add_item_group(obs_properties_t *root, struct cpat_renderer *r, int i, enum cpat_host host)
-{
-	char key[64];
-	char label[128];
-
-	snprintf(label, sizeof(label), "%s %d", obs_module_text("Constellations.Item"), i + 1);
-	obs_properties_t *grp = obs_properties_create();
-
-	snprintf(key, sizeof(key), "item_%d_enabled", i + 1);
-	obs_property_t *en = obs_properties_add_bool(grp, key, obs_module_text("Constellations.Item.Enabled"));
-	obs_property_set_modified_callback(en, item_enabled_modified);
-
-	snprintf(key, sizeof(key), "item_%d_kind", i + 1);
-	obs_property_t *kind = obs_properties_add_list(grp, key, obs_module_text("Constellations.Item.Kind"),
-						       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(kind, obs_module_text("Constellations.Item.Kind.Shape"), CITEM_SHAPE);
-	obs_property_list_add_int(kind, obs_module_text("Constellations.Item.Kind.Image"), CITEM_IMAGE);
-	obs_property_list_add_int(kind, obs_module_text("Constellations.Item.Kind.Source"), CITEM_SOURCE);
-	obs_property_set_modified_callback(kind, item_kind_modified);
-
-	snprintf(key, sizeof(key), "item_%d_shape", i + 1);
-	obs_property_t *sh = obs_properties_add_list(grp, key, obs_module_text("Constellations.Shape"),
-						     OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(sh, obs_module_text("Constellations.Shape.Circle"), CSHAPE_CIRCLE);
-	obs_property_list_add_int(sh, obs_module_text("Constellations.Shape.Cross"), CSHAPE_CROSS);
-	obs_property_list_add_int(sh, obs_module_text("Constellations.Shape.Square"), CSHAPE_SQUARE);
-	obs_property_list_add_int(sh, obs_module_text("Constellations.Shape.Polygon"), CSHAPE_POLYGON);
-	obs_property_list_add_int(sh, obs_module_text("Constellations.Shape.Squircle"), CSHAPE_SQUIRCLE);
-	obs_property_list_add_int(sh, obs_module_text("Constellations.Shape.HLine"), CSHAPE_HLINE);
-	obs_property_list_add_int(sh, obs_module_text("Constellations.Shape.VLine"), CSHAPE_VLINE);
-	obs_property_list_add_int(sh, obs_module_text("Constellations.Shape.Star"), CSHAPE_STAR);
-	obs_property_list_add_int(sh, obs_module_text("Constellations.Shape.Heart"), CSHAPE_HEART);
-	obs_property_set_modified_callback(sh, item_kind_modified);
-
-	snprintf(key, sizeof(key), "item_%d_outline_only", i + 1);
-	obs_property_t *ol = obs_properties_add_bool(grp, key, obs_module_text("Constellations.Item.OutlineOnly"));
-	obs_property_set_modified_callback(ol, item_kind_modified);
-
-	snprintf(key, sizeof(key), "item_%d_polygon_sides", i + 1);
-	obs_properties_add_int_slider(grp, key, obs_module_text("Constellations.Shape.PolySides"), 3, 24, 1);
-	snprintf(key, sizeof(key), "item_%d_stroke_thickness", i + 1);
-	obs_properties_add_float_slider(grp, key, obs_module_text("Constellations.Shape.StrokeThickness"), 0.02, 1.0,
-					0.01);
-	snprintf(key, sizeof(key), "item_%d_color", i + 1);
-	obs_properties_add_color_alpha(grp, key, obs_module_text("Constellations.Shape.Color"));
-
-	snprintf(key, sizeof(key), "item_%d_image_preset", i + 1);
-	obs_property_t *ipr = obs_properties_add_list(grp, key, obs_module_text("Constellations.Item.ImagePreset"),
-						      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
-	obs_property_list_add_string(ipr, obs_module_text("Constellations.Item.ImagePreset.Custom"), "");
-	for (size_t k = 0; k < sizeof(cpat_image_presets) / sizeof(cpat_image_presets[0]); ++k)
-		obs_property_list_add_string(ipr, obs_module_text(cpat_image_presets[k][1]), cpat_image_presets[k][0]);
-	obs_property_set_modified_callback(ipr, item_kind_modified);
-
-	snprintf(key, sizeof(key), "item_%d_image_path", i + 1);
-	obs_properties_add_path(grp, key, obs_module_text("Constellations.Item.ImagePath"), OBS_PATH_FILE,
-				"Images (*.png *.jpg *.jpeg *.bmp *.tga *.gif *.svg);;SVG (*.svg);;All Files (*.*)",
-				NULL);
-
-	snprintf(key, sizeof(key), "item_%d_source_name", i + 1);
-	obs_property_t *src = obs_properties_add_list(grp, key, obs_module_text("Constellations.Item.Source"),
-						      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
-	fill_source_dropdown(src, r ? r->owner : NULL);
-
-	snprintf(key, sizeof(key), "item_%d_image_color_mode", i + 1);
-	obs_property_t *icm = obs_properties_add_list(grp, key, obs_module_text("Constellations.Item.ImageColor"),
-						      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(icm, obs_module_text("Constellations.Item.ImageColor.Original"), CIMGCOLOR_ORIGINAL);
-	obs_property_list_add_int(icm, obs_module_text("Constellations.Item.ImageColor.Tint"), CIMGCOLOR_TINT);
-	obs_property_list_add_int(icm, obs_module_text("Constellations.Item.ImageColor.Recolor"), CIMGCOLOR_RECOLOR);
-	obs_property_set_long_description(icm, obs_module_text("Constellations.Item.ImageColor.Tooltip"));
-	obs_property_set_modified_callback(icm, item_kind_modified);
-	snprintf(key, sizeof(key), "item_%d_image_tint", i + 1);
-	obs_properties_add_color(grp, key, obs_module_text("Constellations.Item.ImageTint"));
-	snprintf(key, sizeof(key), "item_%d_image_opacity", i + 1);
-	obs_properties_add_float_slider(grp, key, obs_module_text("Constellations.Item.ImageOpacity"), 0.0, 100.0, 1.0);
-	snprintf(key, sizeof(key), "item_%d_keep_aspect", i + 1);
-	obs_properties_add_bool(grp, key, obs_module_text("Constellations.Item.KeepAspect"));
-
-	snprintf(key, sizeof(key), "item_%d_random_colors", i + 1);
-	obs_property_t *rc = obs_properties_add_bool(grp, key, obs_module_text("Constellations.Item.RandomColors"));
-	obs_property_set_long_description(rc, obs_module_text("Constellations.Item.RandomColors.Tooltip"));
-	obs_property_set_modified_callback(rc, item_kind_modified);
-	snprintf(key, sizeof(key), "item_%d_color_b", i + 1);
-	obs_properties_add_color(grp, key, obs_module_text("Constellations.Item.ColorB"));
-	snprintf(key, sizeof(key), "item_%d_color_c", i + 1);
-	obs_properties_add_color(grp, key, obs_module_text("Constellations.Item.ColorC"));
-
-	snprintf(key, sizeof(key), "item_%d_size", i + 1);
-	obs_properties_add_float_slider(grp, key, obs_module_text("Constellations.Item.Size"), 1.0, 1024.0, 1.0);
-	snprintf(key, sizeof(key), "item_%d_rotation", i + 1);
-	obs_properties_add_float_slider(grp, key, obs_module_text("Constellations.Item.Rotation"), 0.0, 360.0, 1.0);
-	snprintf(key, sizeof(key), "item_%d_offset_x", i + 1);
-	obs_property_t *ox = obs_properties_add_float_slider(grp, key, obs_module_text("Constellations.Item.OffsetX"),
-							     -1000.0, 1000.0, 1.0);
-	snprintf(key, sizeof(key), "item_%d_offset_y", i + 1);
-	obs_property_t *oy = obs_properties_add_float_slider(grp, key, obs_module_text("Constellations.Item.OffsetY"),
-							     -1000.0, 1000.0, 1.0);
-	if (host == CPAT_HOST_BORDER) {
-		obs_property_set_long_description(ox, obs_module_text("Constellations.Border.OffsetX.Tooltip"));
-		obs_property_set_long_description(oy, obs_module_text("Constellations.Border.OffsetY.Tooltip"));
-	}
-	snprintf(key, sizeof(key), "item_%d_density", i + 1);
-	obs_properties_add_float_slider(grp, key, obs_module_text("Constellations.Item.Density"), 0.1, 20.0, 0.1);
-
-	snprintf(key, sizeof(key), "item_%d_twinkle_mode", i + 1);
-	obs_property_t *twm = obs_properties_add_list(grp, key, obs_module_text("Constellations.Item.Twinkle"),
-						      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(twm, obs_module_text("Constellations.Item.Twinkle.Global"), CTWINKLE_GLOBAL);
-	obs_property_list_add_int(twm, obs_module_text("Constellations.Item.Twinkle.Custom"), CTWINKLE_CUSTOM);
-	obs_property_list_add_int(twm, obs_module_text("Constellations.Item.Twinkle.Off"), CTWINKLE_OFF);
-	obs_property_set_modified_callback(twm, item_twinkle_modified);
-	snprintf(key, sizeof(key), "item_%d_twinkle_amount", i + 1);
-	obs_properties_add_float_slider(grp, key, obs_module_text("Constellations.Item.TwinkleAmount"), 0.0, 1.0, 0.01);
-	snprintf(key, sizeof(key), "item_%d_twinkle_speed", i + 1);
-	obs_properties_add_float_slider(grp, key, obs_module_text("Constellations.Item.TwinkleSpeed"), 0.05, 5.0, 0.05);
-
-	snprintf(key, sizeof(key), "item_%d_speed_drift_mode", i + 1);
-	obs_property_t *sdm = obs_properties_add_list(grp, key, obs_module_text("Constellations.Item.SpeedDrift"),
-						      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(sdm, obs_module_text("Constellations.Item.SpeedDrift.Global"), CSDRIFT_GLOBAL);
-	obs_property_list_add_int(sdm, obs_module_text("Constellations.Item.SpeedDrift.Custom"), CSDRIFT_CUSTOM);
-	obs_property_list_add_int(sdm, obs_module_text("Constellations.Item.SpeedDrift.Off"), CSDRIFT_OFF);
-	obs_property_set_modified_callback(sdm, item_speed_drift_modified);
-	snprintf(key, sizeof(key), "item_%d_speed_drift_amount", i + 1);
-	obs_properties_add_float_slider(grp, key, obs_module_text("Constellations.Item.SpeedDriftAmount"), 0.0, 1.0,
-					0.01);
-
-	snprintf(key, sizeof(key), "item_%d_autorot_mode", i + 1);
-	obs_property_t *arm = obs_properties_add_list(grp, key, obs_module_text("Constellations.Item.AutoRot"),
-						      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(arm, obs_module_text("Constellations.Item.AutoRot.Global"), CAROT_GLOBAL);
-	obs_property_list_add_int(arm, obs_module_text("Constellations.Item.AutoRot.Custom"), CAROT_CUSTOM);
-	obs_property_list_add_int(arm, obs_module_text("Constellations.Item.AutoRot.Off"), CAROT_OFF);
-	obs_property_set_modified_callback(arm, item_autorot_modified);
-	snprintf(key, sizeof(key), "item_%d_autorot_style", i + 1);
-	obs_property_t *ars = obs_properties_add_list(grp, key, obs_module_text("Constellations.Item.AutoRotStyle"),
-						      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(ars, obs_module_text("Constellations.AutoRot.Style.Random"), CAROT_STYLE_RANDOM);
-	obs_property_list_add_int(ars, obs_module_text("Constellations.AutoRot.Style.Unison"), CAROT_STYLE_UNISON);
-	obs_property_set_modified_callback(ars, item_autorot_modified);
-	snprintf(key, sizeof(key), "item_%d_autorot_speed", i + 1);
-	obs_properties_add_float_slider(grp, key, obs_module_text("Constellations.Item.AutoRotSpeed"), -360.0, 360.0,
-					1.0);
-	snprintf(key, sizeof(key), "item_%d_autorot_seed", i + 1);
-	obs_properties_add_int_slider(grp, key, obs_module_text("Constellations.Item.AutoRotSeed"), 0, 1000, 1);
-
-	char gid[64];
-	snprintf(gid, sizeof(gid), "item_%d_group", i + 1);
-	obs_properties_add_group(root, gid, label, OBS_GROUP_NORMAL, grp);
-}
-
-void cpat_renderer_get_properties(struct cpat_renderer *r, obs_properties_t *props, enum cpat_host host)
-{
-	if (host == CPAT_HOST_SOURCE) {
-		obs_properties_t *canvas = obs_properties_create();
-		obs_properties_add_int(canvas, "width", obs_module_text("Constellations.Canvas.Width"), 1, 8192, 1);
-		obs_properties_add_int(canvas, "height", obs_module_text("Constellations.Canvas.Height"), 1, 8192, 1);
-		add_background_props(canvas, false);
-		obs_properties_add_float_slider(canvas, "anchor_x_pct", obs_module_text("Constellations.Anchor.X"), 0.0,
-						100.0, 0.5);
-		obs_properties_add_float_slider(canvas, "anchor_y_pct", obs_module_text("Constellations.Anchor.Y"), 0.0,
-						100.0, 0.5);
-		obs_properties_add_float_slider(canvas, "canvas_rotation",
-						obs_module_text("Constellations.Canvas.Rotation"), 0.0, 360.0, 1.0);
-		obs_properties_add_group(props, "canvas_group", obs_module_text("Constellations.Group.Canvas"),
-					 OBS_GROUP_NORMAL, canvas);
-	} else {
-		if (host == CPAT_HOST_BORDER) {
-			obs_properties_t *fill = obs_properties_create();
-			add_background_props(fill, true);
-			obs_properties_add_group(props, "border_fill_group",
-						 obs_module_text("Constellations.Group.BorderFill"), OBS_GROUP_NORMAL,
-						 fill);
-		} else {
-			add_background_props(props, false);
-		}
-		obs_properties_add_float_slider(props, "anchor_x_pct", obs_module_text("Constellations.Anchor.X"), 0.0,
-						100.0, 0.5);
-		obs_properties_add_float_slider(props, "anchor_y_pct", obs_module_text("Constellations.Anchor.Y"), 0.0,
-						100.0, 0.5);
-		obs_properties_add_float_slider(props, "canvas_rotation",
-						obs_module_text("Constellations.Canvas.Rotation"), 0.0, 360.0, 1.0);
-	}
-
-	obs_property_t *ic = obs_properties_add_int_slider(
-		props, "item_count", obs_module_text("Constellations.ItemCount"), 1, CONSTELLATIONS_MAX_ITEMS, 1);
-	obs_property_set_modified_callback(ic, item_count_modified);
-
-	obs_property_t *lm = obs_properties_add_list(props, "layout_mode", obs_module_text("Constellations.Layout"),
-						     OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(lm, obs_module_text("Constellations.Layout.Layered"), CLAYOUT_LAYERED);
-	obs_property_list_add_int(lm, obs_module_text("Constellations.Layout.StepRepeat"), CLAYOUT_STEP_REPEAT);
-	obs_property_list_add_int(lm, obs_module_text("Constellations.Layout.Grid"), CLAYOUT_GRID);
-	obs_property_set_modified_callback(lm, layout_mode_modified);
-
-	obs_property_t *go = obs_properties_add_list(props, "grid_order",
-						     obs_module_text("Constellations.Layout.GridOrder"),
-						     OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(go, obs_module_text("Constellations.Layout.GridOrder.Random"), CGRID_RANDOM);
-	obs_property_list_add_int(go, obs_module_text("Constellations.Layout.GridOrder.Ordered"), CGRID_ORDERED);
-
-	for (int i = 0; i < CONSTELLATIONS_MAX_ITEMS; ++i)
-		add_item_group(props, r, i, host);
-
-	obs_properties_t *motion = obs_properties_create();
-	obs_properties_add_float_slider(motion, "motion_angle", obs_module_text("Constellations.Motion.Angle"), 0.0,
-					360.0, 1.0);
-	obs_property_t *ms = obs_properties_add_float_slider(
-		motion, "motion_speed", obs_module_text("Constellations.Motion.Speed"), -500.0, 500.0, 1.0);
-	if (host == CPAT_HOST_BORDER)
-		obs_property_set_long_description(ms, obs_module_text("Constellations.Border.MotionSpeed.Tooltip"));
-	obs_properties_add_button2(motion, "motion_reset", obs_module_text("Constellations.Motion.Reset"),
-				   motion_reset_clicked, r);
-	obs_properties_add_bool(motion, "alternating_lines", obs_module_text("Constellations.Motion.Alternating"));
-	obs_property_t *sd =
-		obs_properties_add_bool(motion, "speed_drift", obs_module_text("Constellations.Motion.SpeedDrift"));
-	obs_property_set_modified_callback(sd, motion_modified);
-	obs_properties_add_float_slider(motion, "speed_drift_amount",
-					obs_module_text("Constellations.Motion.SpeedDriftAmount"), 0.0, 1.0, 0.01);
-	obs_property_t *ld = obs_properties_add_bool(motion, "location_drift",
-						     obs_module_text("Constellations.Motion.LocationDrift"));
-	obs_property_set_modified_callback(ld, motion_modified);
-	obs_properties_add_float_slider(motion, "location_drift_amount",
-					obs_module_text("Constellations.Motion.LocationDriftAmount"), 0.0, 1.0, 0.01);
-	obs_properties_add_group(props, "motion_group", obs_module_text("Constellations.Group.Motion"),
-				 OBS_GROUP_NORMAL, motion);
-
-	obs_properties_t *tw = obs_properties_create();
-	obs_property_t *te =
-		obs_properties_add_bool(tw, "twinkle_enabled", obs_module_text("Constellations.Twinkle.Enabled"));
-	obs_property_set_modified_callback(te, twinkle_modified);
-	obs_properties_add_float_slider(tw, "twinkle_amount", obs_module_text("Constellations.Twinkle.Amount"), 0.0,
-					1.0, 0.01);
-	obs_properties_add_float_slider(tw, "twinkle_speed", obs_module_text("Constellations.Twinkle.Speed"), 0.05, 5.0,
-					0.05);
-	obs_properties_add_group(props, "twinkle_group", obs_module_text("Constellations.Group.Twinkle"),
-				 OBS_GROUP_NORMAL, tw);
-
-	obs_properties_t *ar = obs_properties_create();
-	obs_property_t *are =
-		obs_properties_add_bool(ar, "autorot_enabled", obs_module_text("Constellations.AutoRot.Enabled"));
-	obs_property_set_modified_callback(are, autorot_modified);
-	obs_property_t *arst = obs_properties_add_list(ar, "autorot_style",
-						       obs_module_text("Constellations.AutoRot.Style"),
-						       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(arst, obs_module_text("Constellations.AutoRot.Style.Random"), CAROT_STYLE_RANDOM);
-	obs_property_list_add_int(arst, obs_module_text("Constellations.AutoRot.Style.Unison"), CAROT_STYLE_UNISON);
-	obs_property_set_modified_callback(arst, autorot_modified);
-	obs_properties_add_float_slider(ar, "autorot_speed", obs_module_text("Constellations.AutoRot.Speed"), -360.0,
-					360.0, 1.0);
-	obs_properties_add_int_slider(ar, "autorot_seed", obs_module_text("Constellations.AutoRot.Seed"), 0, 1000, 1);
-	obs_properties_add_group(props, "autorot_group", obs_module_text("Constellations.Group.AutoRotation"),
-				 OBS_GROUP_NORMAL, ar);
-
-	/* The border's inner edge softness covers what a vignette would do. */
-	if (host == CPAT_HOST_BORDER)
-		return;
-
-	obs_properties_t *vg = obs_properties_create();
-	obs_property_t *ve =
-		obs_properties_add_bool(vg, "vignette_enabled", obs_module_text("Constellations.Vignette.Enabled"));
-	obs_property_set_modified_callback(ve, vignette_modified);
-	obs_properties_add_float_slider(vg, "vignette_size", obs_module_text("Constellations.Vignette.Size"), 0.01, 2.0,
-					0.01);
-	obs_properties_add_float_slider(vg, "vignette_anchor_x_pct", obs_module_text("Constellations.Vignette.AnchorX"),
-					0.0, 100.0, 0.5);
-	obs_properties_add_float_slider(vg, "vignette_anchor_y_pct", obs_module_text("Constellations.Vignette.AnchorY"),
-					0.0, 100.0, 0.5);
-	obs_properties_add_float_slider(vg, "vignette_direction", obs_module_text("Constellations.Vignette.Direction"),
-					0.0, 360.0, 1.0);
-	obs_property_t *vs = obs_properties_add_list(vg, "vignette_shape",
-						     obs_module_text("Constellations.Vignette.Shape"),
-						     OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	obs_property_list_add_int(vs, obs_module_text("Constellations.Vignette.Shape.Circle"), CVIGN_CIRCLE);
-	obs_property_list_add_int(vs, obs_module_text("Constellations.Vignette.Shape.Linear"), CVIGN_LINEAR);
-	obs_property_list_add_int(vs, obs_module_text("Constellations.Vignette.Shape.Square"), CVIGN_SQUARE);
-	obs_property_list_add_int(vs, obs_module_text("Constellations.Vignette.Shape.Polygon"), CVIGN_POLYGON);
-	obs_property_set_modified_callback(vs, vignette_modified);
-	obs_properties_add_int_slider(vg, "vignette_polygon_sides",
-				      obs_module_text("Constellations.Vignette.PolygonSides"), 3, 24, 1);
-	obs_properties_add_float_slider(vg, "vignette_softness", obs_module_text("Constellations.Vignette.Falloff"),
-					0.0, 4.0, 0.01);
-	obs_properties_add_bool(vg, "vignette_inverted", obs_module_text("Constellations.Vignette.Inverted"));
-	obs_properties_add_group(props, "vignette_group", obs_module_text("Constellations.Group.Vignette"),
-				 OBS_GROUP_NORMAL, vg);
-}
-
-static void cpat_item_update(struct cpat_item *it, obs_data_t *settings, int index, obs_source_t *exclude)
-{
-	char key[64];
-#define IK(name) (snprintf(key, sizeof(key), "item_%d_%s", index + 1, name), key)
+#define IK(name) cpat_item_key(key, sizeof(key), i, name)
 	it->enabled = obs_data_get_bool(settings, IK("enabled"));
 	it->kind = (int)obs_data_get_int(settings, IK("kind"));
 	it->shape = (int)obs_data_get_int(settings, IK("shape"));
 	it->outline_only = obs_data_get_bool(settings, IK("outline_only"));
-	it->polygon_sides = (int)obs_data_get_int(settings, IK("polygon_sides"));
+	it->polygon_sides = (float)obs_data_get_int(settings, IK("polygon_sides"));
 	it->stroke_thickness = (float)obs_data_get_double(settings, IK("stroke_thickness"));
-	uint32_t c = (uint32_t)obs_data_get_int(settings, IK("color"));
-	vec4_from_rgba(&it->color, c);
-
-	/* A built-in preset overrides the custom file; image_path holds
-	 * whichever path is actually loaded. */
-	const char *preset = obs_data_get_string(settings, IK("image_preset"));
-	char *preset_path = NULL;
-	if (*preset) {
-		char rel[64];
-		snprintf(rel, sizeof(rel), "images/%s.svg", preset);
-		preset_path = obs_module_file(rel);
-	}
-	const char *ip = preset_path ? preset_path : obs_data_get_string(settings, IK("image_path"));
-	bool image_changed = !it->image_path || strcmp(ip, it->image_path) != 0;
-	if (image_changed) {
-		bfree(it->image_path);
-		it->image_path = bstrdup(ip);
-		if (it->kind == CITEM_IMAGE)
-			cpat_item_acquire_image(it);
-	} else if (it->kind == CITEM_IMAGE && !it->image_loaded) {
-		cpat_item_acquire_image(it);
-	} else if (it->kind != CITEM_IMAGE && it->image_loaded) {
-		cpat_item_release_image(it);
-	}
-	bfree(preset_path);
-
-	const char *sn = obs_data_get_string(settings, IK("source_name"));
-	bool source_changed = !it->source_name || strcmp(sn, it->source_name) != 0;
-	if (source_changed) {
-		bfree(it->source_name);
-		it->source_name = bstrdup(sn);
-		if (it->kind == CITEM_SOURCE)
-			cpat_item_acquire_source(it, exclude);
-		else
-			cpat_item_release_source(it);
-	} else if (it->kind == CITEM_SOURCE && !it->source_ref) {
-		cpat_item_acquire_source(it, exclude);
-	} else if (it->kind != CITEM_SOURCE && it->source_ref) {
-		cpat_item_release_source(it);
-	}
+	cfx_color_linear(&it->color, (uint32_t)obs_data_get_int(settings, IK("color")));
 
 	it->image_color_mode = (int)obs_data_get_int(settings, IK("image_color_mode"));
-	vec4_from_rgba(&it->image_tint, (uint32_t)obs_data_get_int(settings, IK("image_tint")));
+	cfx_color_linear(&it->image_tint, (uint32_t)obs_data_get_int(settings, IK("image_tint")));
 	it->image_opacity = (float)obs_data_get_double(settings, IK("image_opacity")) / 100.0f;
 	it->keep_aspect = obs_data_get_bool(settings, IK("keep_aspect"));
 	it->random_colors = obs_data_get_bool(settings, IK("random_colors"));
-	vec4_from_rgba(&it->color_b, (uint32_t)obs_data_get_int(settings, IK("color_b")));
-	vec4_from_rgba(&it->color_c, (uint32_t)obs_data_get_int(settings, IK("color_c")));
+	cfx_color_linear(&it->color_b, (uint32_t)obs_data_get_int(settings, IK("color_b")));
+	cfx_color_linear(&it->color_c, (uint32_t)obs_data_get_int(settings, IK("color_c")));
+
+	it->source_uuid = bstrdup(obs_data_get_string(settings, IK("source")));
+	/* Once an item has a UUID setting (even "None"), the name saved by
+	 * older versions no longer applies. */
+	if (!obs_data_has_user_value(settings, IK("source")))
+		it->source_name = bstrdup(obs_data_get_string(settings, IK("source_name")));
+	else
+		it->source_name = bstrdup("");
 
 	it->size = (float)obs_data_get_double(settings, IK("size"));
 	if (it->size < 1.0f)
 		it->size = 1.0f;
-	cpat_item_refresh_svg(it);
 	it->rotation_deg = (float)obs_data_get_double(settings, IK("rotation"));
 	it->offset_x = (float)obs_data_get_double(settings, IK("offset_x"));
 	it->offset_y = (float)obs_data_get_double(settings, IK("offset_y"));
 	it->density = (float)obs_data_get_double(settings, IK("density"));
-	if (it->density <= 0.0f)
+	if (it->density < 0.1f)
 		it->density = 0.1f;
 	it->twinkle_mode = (int)obs_data_get_int(settings, IK("twinkle_mode"));
 	it->twinkle_amount = (float)obs_data_get_double(settings, IK("twinkle_amount"));
@@ -1078,502 +434,909 @@ static void cpat_item_update(struct cpat_item *it, obs_data_t *settings, int ind
 #undef IK
 }
 
-void cpat_renderer_update(struct cpat_renderer *r, obs_data_t *settings)
+/* The artwork an image item needs, as a key: decoding happens only when it
+ * changes. SVGs include their raster size. *path receives the file. */
+static char *item_media_key(const struct cpat_item_cfg *it, obs_data_t *settings, int i, char **path)
+{
+	*path = NULL;
+	if (it->kind != CITEM_IMAGE)
+		return bstrdup("");
+	char key[64];
+	const char *preset = obs_data_get_string(settings, cpat_item_key(key, sizeof(key), i, "image_preset"));
+	char *p = *preset ? preset_path(preset) : NULL;
+	if (!p) {
+		const char *custom = obs_data_get_string(settings, cpat_item_key(key, sizeof(key), i, "image_path"));
+		if (!*custom)
+			return bstrdup("");
+		p = bstrdup(custom);
+	}
+	struct dstr k = {0};
+	if (cpat_media_is_svg(p))
+		dstr_printf(&k, "svg:%u:%s", cpat_media_svg_px(it->size), p);
+	else
+		dstr_printf(&k, "img:%s", p);
+	*path = p;
+	return k.array;
+}
+
+static struct cpat_pixels *load_item_media(struct cpat_renderer *r, int i, const char *path, float size)
+{
+	if (!cpat_media_is_svg(path))
+		return cpat_pixels_from_file(path);
+	if (!r->svg_cache[i].path || strcmp(r->svg_cache[i].path, path) != 0) {
+		cpat_media_svg_free(r->svg_cache[i].svg);
+		bfree(r->svg_cache[i].path);
+		r->svg_cache[i].path = bstrdup(path);
+		r->svg_cache[i].svg = cpat_media_svg_load(path);
+	}
+	return cpat_pixels_from_svg(r->svg_cache[i].svg, cpat_media_svg_px(size));
+}
+
+static void read_config(struct cpat_renderer *r, struct cpat_config *cfg, obs_data_t *settings)
 {
 	if (r->host == CPAT_HOST_SOURCE) {
-		r->width = (uint32_t)obs_data_get_int(settings, "width");
-		r->height = (uint32_t)obs_data_get_int(settings, "height");
-		if (r->width == 0)
-			r->width = 1920;
-		if (r->height == 0)
-			r->height = 1080;
+		cfg->width = (uint32_t)obs_data_get_int(settings, "width");
+		cfg->height = (uint32_t)obs_data_get_int(settings, "height");
+		if (cfg->width == 0)
+			cfg->width = 1920;
+		if (cfg->height == 0)
+			cfg->height = 1080;
 	}
-	r->background_type = (int)obs_data_get_int(settings, "background_type");
-	vec4_from_rgba(&r->background_color, (uint32_t)obs_data_get_int(settings, "background_color"));
-	vec4_from_rgba(&r->background_color2, (uint32_t)obs_data_get_int(settings, "background_color2"));
-	r->background_angle_deg = (float)obs_data_get_double(settings, "background_angle");
-	r->has_background = r->background_type != CBG_NONE &&
-			    (r->background_color.w > 0.0001f ||
-			     (r->background_type != CBG_SOLID && r->background_color2.w > 0.0001f));
-	r->anchor_x_pct = (float)obs_data_get_double(settings, "anchor_x_pct");
-	r->anchor_y_pct = (float)obs_data_get_double(settings, "anchor_y_pct");
-	r->canvas_rotation_deg = (float)obs_data_get_double(settings, "canvas_rotation");
+	cfg->background_type = (int)obs_data_get_int(settings, "background_type");
+	vec4_from_rgba(&cfg->background_color, (uint32_t)obs_data_get_int(settings, "background_color"));
+	vec4_from_rgba(&cfg->background_color2, (uint32_t)obs_data_get_int(settings, "background_color2"));
+	cfg->background_angle_deg = (float)obs_data_get_double(settings, "background_angle");
+	cfg->has_background = cfg->background_type != CBG_NONE &&
+			      (cfg->background_color.w > 0.0001f ||
+			       (cfg->background_type != CBG_SOLID && cfg->background_color2.w > 0.0001f));
+	cfg->anchor_x_pct = (float)obs_data_get_double(settings, "anchor_x_pct");
+	cfg->anchor_y_pct = (float)obs_data_get_double(settings, "anchor_y_pct");
+	cfg->canvas_rotation_deg = (float)obs_data_get_double(settings, "canvas_rotation");
 
 	int ic = (int)obs_data_get_int(settings, "item_count");
-	if (ic < 1)
-		ic = 1;
-	if (ic > CONSTELLATIONS_MAX_ITEMS)
-		ic = CONSTELLATIONS_MAX_ITEMS;
-	r->item_count = (uint32_t)ic;
+	cfg->item_count = (uint32_t)(ic < 1 ? 1 : (ic > MAX_ITEMS ? MAX_ITEMS : ic));
+	cfg->layout_mode = (int)obs_data_get_int(settings, "layout_mode");
+	cfg->grid_order = (int)obs_data_get_int(settings, "grid_order");
+	for (int i = 0; i < MAX_ITEMS; ++i)
+		read_item(&cfg->items[i], settings, i);
 
-	r->layout_mode = (int)obs_data_get_int(settings, "layout_mode");
-	r->grid_order = (int)obs_data_get_int(settings, "grid_order");
+	cfg->motion_angle_deg = (float)obs_data_get_double(settings, "motion_angle");
+	cfg->motion_speed = (float)obs_data_get_double(settings, "motion_speed");
+	cfg->alternating_lines = obs_data_get_bool(settings, "alternating_lines");
+	cfg->speed_drift = obs_data_get_bool(settings, "speed_drift");
+	cfg->speed_drift_amount = (float)obs_data_get_double(settings, "speed_drift_amount");
+	cfg->location_drift = obs_data_get_bool(settings, "location_drift");
+	cfg->location_drift_amount = (float)obs_data_get_double(settings, "location_drift_amount");
 
-	for (int i = 0; i < CONSTELLATIONS_MAX_ITEMS; ++i)
-		cpat_item_update(&r->items[i], settings, i, r->owner);
+	cfg->twinkle_enabled = obs_data_get_bool(settings, "twinkle_enabled");
+	cfg->twinkle_amount = (float)obs_data_get_double(settings, "twinkle_amount");
+	cfg->twinkle_speed = (float)obs_data_get_double(settings, "twinkle_speed");
 
-	r->motion_angle_deg = (float)obs_data_get_double(settings, "motion_angle");
-	r->motion_speed = (float)obs_data_get_double(settings, "motion_speed");
-	r->alternating_lines = obs_data_get_bool(settings, "alternating_lines");
-	r->speed_drift = obs_data_get_bool(settings, "speed_drift");
-	r->speed_drift_amount = (float)obs_data_get_double(settings, "speed_drift_amount");
-	r->location_drift = obs_data_get_bool(settings, "location_drift");
-	r->location_drift_amount = (float)obs_data_get_double(settings, "location_drift_amount");
+	cfg->autorot_enabled = obs_data_get_bool(settings, "autorot_enabled");
+	cfg->autorot_speed = (float)obs_data_get_double(settings, "autorot_speed");
+	cfg->autorot_style = (int)obs_data_get_int(settings, "autorot_style");
+	cfg->autorot_seed = (float)obs_data_get_int(settings, "autorot_seed");
 
-	r->twinkle_enabled = obs_data_get_bool(settings, "twinkle_enabled");
-	r->twinkle_amount = (float)obs_data_get_double(settings, "twinkle_amount");
-	r->twinkle_speed = (float)obs_data_get_double(settings, "twinkle_speed");
+	/* The border's inner edge softness covers what a vignette would do. */
+	cfg->vignette_enabled = r->host != CPAT_HOST_BORDER && obs_data_get_bool(settings, "vignette_enabled");
+	cfg->vignette_size = (float)obs_data_get_double(settings, "vignette_size");
+	cfg->vignette_anchor_x_pct = (float)obs_data_get_double(settings, "vignette_anchor_x_pct");
+	cfg->vignette_anchor_y_pct = (float)obs_data_get_double(settings, "vignette_anchor_y_pct");
+	cfg->vignette_direction_deg = (float)obs_data_get_double(settings, "vignette_direction");
+	cfg->vignette_shape = (int)obs_data_get_int(settings, "vignette_shape");
+	cfg->vignette_polygon_sides = (float)obs_data_get_int(settings, "vignette_polygon_sides");
+	cfg->vignette_softness = (float)obs_data_get_double(settings, "vignette_softness");
+	cfg->vignette_inverted = obs_data_get_bool(settings, "vignette_inverted");
 
-	r->autorot_enabled = obs_data_get_bool(settings, "autorot_enabled");
-	r->autorot_speed = (float)obs_data_get_double(settings, "autorot_speed");
-	r->autorot_style = (int)obs_data_get_int(settings, "autorot_style");
-	r->autorot_seed = (float)obs_data_get_int(settings, "autorot_seed");
-
-	r->vignette_enabled = obs_data_get_bool(settings, "vignette_enabled");
-	r->vignette_size = (float)obs_data_get_double(settings, "vignette_size");
-	r->vignette_anchor_x_pct = (float)obs_data_get_double(settings, "vignette_anchor_x_pct");
-	r->vignette_anchor_y_pct = (float)obs_data_get_double(settings, "vignette_anchor_y_pct");
-	r->vignette_direction_deg = (float)obs_data_get_double(settings, "vignette_direction");
-	r->vignette_shape = (int)obs_data_get_int(settings, "vignette_shape");
-	r->vignette_polygon_sides = (int)obs_data_get_int(settings, "vignette_polygon_sides");
-	r->vignette_softness = (float)obs_data_get_double(settings, "vignette_softness");
-	r->vignette_inverted = obs_data_get_bool(settings, "vignette_inverted");
 	if (r->host == CPAT_HOST_BORDER)
-		r->vignette_enabled = false;
+		cpat_border_read_settings(settings, &cfg->border);
+}
+
+void cpat_renderer_update(struct cpat_renderer *r, obs_data_t *settings)
+{
+	struct cpat_config *cfg = bzalloc(sizeof(*cfg));
+
+	pthread_mutex_lock(&r->update_mutex);
+	read_config(r, cfg, settings);
+	for (int i = 0; i < MAX_ITEMS; ++i) {
+		struct cpat_item_cfg *it = &cfg->items[i];
+		char *path;
+		it->media_key = item_media_key(it, settings, i, &path);
+		if (!r->submitted_keys[i] || strcmp(r->submitted_keys[i], it->media_key) != 0) {
+			if (path)
+				it->pixels = load_item_media(r, i, path, it->size);
+			bfree(r->submitted_keys[i]);
+			r->submitted_keys[i] = bstrdup(it->media_key);
+		}
+		bfree(path);
+	}
+	pthread_mutex_unlock(&r->update_mutex);
+
+	os_atomic_set_long(&r->width, (long)cfg->width);
+	os_atomic_set_long(&r->height, (long)cfg->height);
+
+	pthread_mutex_lock(&r->pending_mutex);
+	struct cpat_config *old = r->pending;
+	if (old) {
+		/* The previous configuration was never applied; keep any
+		 * artwork it decoded that this one still uses. */
+		for (int i = 0; i < MAX_ITEMS; ++i) {
+			struct cpat_item_cfg *it = &cfg->items[i];
+			if (!it->pixels && old->items[i].pixels &&
+			    strcmp(old->items[i].media_key, it->media_key) == 0) {
+				it->pixels = old->items[i].pixels;
+				old->items[i].pixels = NULL;
+			}
+		}
+	}
+	r->pending = cfg;
+	pthread_mutex_unlock(&r->pending_mutex);
+	config_free(old);
+}
+
+/* ------------------------------------------------------- source items */
+
+static obs_source_t *self_for_cycles(const struct cpat_renderer *r)
+{
+	/* A filter draws as part of its parent, so the parent is what must
+	 * not end up inside one of its items. */
+	return r->host == CPAT_HOST_SOURCE ? r->owner : obs_filter_get_parent(r->owner);
+}
+
+/* Takes or drops the showing/active refs a used source needs, so media
+ * plays and browser sources render inside the pattern. */
+static void sync_child_refs(struct cpat_renderer *r, int i)
+{
+	struct cpat_gpu_item *g = &r->gpu[i];
+	const struct cpat_config *cfg = r->cfg;
+	bool used = g->source && cfg && (uint32_t)i < cfg->item_count && cfg->items[i].enabled &&
+		    cfg->items[i].kind == CITEM_SOURCE;
+	bool want_show = used && r->showing;
+	bool want_active = used && r->active;
+	if (want_show == g->shown && want_active == g->activated)
+		return;
+	obs_source_t *src = g->source ? obs_weak_source_get_source(g->source) : NULL;
+	if (src) {
+		if (want_show != g->shown) {
+			if (want_show)
+				obs_source_inc_showing(src);
+			else
+				obs_source_dec_showing(src);
+		}
+		if (want_active != g->activated) {
+			if (want_active)
+				obs_source_inc_active(src);
+			else
+				obs_source_dec_active(src);
+		}
+		obs_source_release(src);
+	}
+	g->shown = want_show;
+	g->activated = want_active;
+}
+
+static void release_item_source(struct cpat_renderer *r, int i)
+{
+	struct cpat_gpu_item *g = &r->gpu[i];
+	if (g->source) {
+		obs_source_t *src = obs_weak_source_get_source(g->source);
+		if (src) {
+			if (g->shown)
+				obs_source_dec_showing(src);
+			if (g->activated)
+				obs_source_dec_active(src);
+			obs_source_release(src);
+		}
+		obs_weak_source_release(g->source);
+		g->source = NULL;
+	}
+	g->shown = g->activated = false;
+	if (g->texrender) {
+		gs_texrender_destroy(g->texrender);
+		g->texrender = NULL;
+	}
+}
+
+static void resolve_item_source(struct cpat_renderer *r, int i)
+{
+	struct cpat_gpu_item *g = &r->gpu[i];
+	obs_source_t *src = NULL;
+	if (g->source_uuid && *g->source_uuid)
+		src = obs_get_source_by_uuid(g->source_uuid);
+	else if (g->source_name && *g->source_name)
+		src = obs_get_source_by_name(g->source_name);
+	if (!src)
+		return;
+	if (cfx_source_contains(src, self_for_cycles(r)) || src == r->owner) {
+		if (!g->cycle_warned)
+			obs_log(LOG_WARNING,
+				"'%s' item %d: '%s' contains this pattern, so it cannot be drawn inside it",
+				obs_source_get_name(r->owner), i + 1, obs_source_get_name(src));
+		g->cycle_warned = true;
+		obs_source_release(src);
+		return;
+	}
+	g->source = obs_source_get_weak_source(src);
+	obs_source_release(src);
+	g->texrender = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+}
+
+static bool str_differs(const char *a, const char *b)
+{
+	return strcmp(a ? a : "", b ? b : "") != 0;
+}
+
+/* --------------------------------------------------------- tick/apply */
+
+/* Graphics thread, inside obs_enter_graphics(). */
+static void apply_config(struct cpat_renderer *r, struct cpat_config *cfg)
+{
+	struct cpat_config *old = r->cfg;
+	r->cfg = cfg;
+	for (int i = 0; i < MAX_ITEMS; ++i) {
+		struct cpat_item_cfg *it = &cfg->items[i];
+		struct cpat_gpu_item *g = &r->gpu[i];
+
+		if (str_differs(g->media_key, it->media_key)) {
+			if (g->texture)
+				gs_texture_destroy(g->texture);
+			g->texture = cpat_pixels_upload(it->pixels);
+			bfree(g->media_key);
+			g->media_key = bstrdup(it->media_key);
+		}
+		cpat_pixels_free(it->pixels);
+		it->pixels = NULL;
+
+		const char *uuid = it->kind == CITEM_SOURCE ? it->source_uuid : "";
+		const char *name = it->kind == CITEM_SOURCE ? it->source_name : "";
+		if (str_differs(g->source_uuid, uuid) || str_differs(g->source_name, name)) {
+			release_item_source(r, i);
+			bfree(g->source_uuid);
+			bfree(g->source_name);
+			g->source_uuid = bstrdup(uuid);
+			g->source_name = bstrdup(name);
+			g->cycle_warned = false;
+			g->resolve_wait = 0.0f;
+		}
+		sync_child_refs(r, i);
+	}
+	config_free(old);
+}
+
+static void effective_speeds(const struct cpat_config *cfg, const struct cpat_item_cfg *it, float *twinkle_cps,
+			     float *spin_dps)
+{
+	*twinkle_cps = 0.0f;
+	if (it->twinkle_mode == CTWINKLE_CUSTOM)
+		*twinkle_cps = it->twinkle_speed;
+	else if (it->twinkle_mode == CTWINKLE_GLOBAL && cfg->twinkle_enabled)
+		*twinkle_cps = cfg->twinkle_speed;
+
+	*spin_dps = 0.0f;
+	if (it->autorot_mode == CAROT_CUSTOM && it->autorot_style == CAROT_STYLE_UNISON)
+		*spin_dps = it->autorot_speed;
+	else if (it->autorot_mode == CAROT_GLOBAL && cfg->autorot_enabled && cfg->autorot_style == CAROT_STYLE_UNISON)
+		*spin_dps = cfg->autorot_speed;
 }
 
 void cpat_renderer_tick(struct cpat_renderer *r, float seconds)
 {
-	/* Integrate motion each tick so speed and angle changes steer the
-	 * pattern instead of teleporting it (same scheme as Topography drift).
-	 * The screen-space velocity is decomposed onto the current lattice
-	 * axes and accumulated in lattice coordinates: that keeps the on-screen
-	 * travel direction equal to the motion angle while letting canvas
-	 * rotation rigidly rotate the whole (scrolled) pattern around the
-	 * anchor instead of around a point displaced by the accumulated
-	 * offset. */
-	double ang = (r->motion_angle_deg - r->canvas_rotation_deg) * (M_PI / 180.0);
-	double step = (double)r->motion_speed * (double)seconds;
-	r->motion_off_along += cos(ang) * step;
-	r->motion_off_perp += sin(ang) * step;
-	r->border_march += step;
-	r->elapsed_time += (double)seconds;
+	pthread_mutex_lock(&r->pending_mutex);
+	struct cpat_config *cfg = r->pending;
+	r->pending = NULL;
+	pthread_mutex_unlock(&r->pending_mutex);
 
-	uint32_t count = r->item_count;
-	if (count > CONSTELLATIONS_MAX_ITEMS)
-		count = CONSTELLATIONS_MAX_ITEMS;
-	for (uint32_t i = 0; i < count; ++i) {
-		struct cpat_item *it = &r->items[i];
-		if (!it->enabled || it->kind != CITEM_SOURCE || !it->source_ref || !it->source_texrender)
-			continue;
-		obs_source_t *src = obs_weak_source_get_source(it->source_ref);
-		if (!src)
-			continue;
-		uint32_t sw = obs_source_get_base_width(src);
-		uint32_t sh = obs_source_get_base_height(src);
-		if (sw && sh) {
-			it->source_w = sw;
-			it->source_h = sh;
+	bool need_graphics = cfg != NULL;
+	for (int i = 0; i < MAX_ITEMS && !need_graphics; ++i) {
+		struct cpat_gpu_item *g = &r->gpu[i];
+		if (!g->source && ((g->source_uuid && *g->source_uuid) || (g->source_name && *g->source_name)))
+			need_graphics = g->resolve_wait <= 0.0f;
+	}
+	if (need_graphics) {
+		obs_enter_graphics();
+		if (cfg)
+			apply_config(r, cfg);
+		/* Sources saved by name, or created after this pattern, are
+		 * looked up again about once a second until they appear. */
+		for (int i = 0; i < MAX_ITEMS; ++i) {
+			struct cpat_gpu_item *g = &r->gpu[i];
+			if (g->source || g->resolve_wait > 0.0f)
+				continue;
+			if ((g->source_uuid && *g->source_uuid) || (g->source_name && *g->source_name)) {
+				resolve_item_source(r, i);
+				g->resolve_wait = 1.0f;
+				sync_child_refs(r, i);
+			}
 		}
-		obs_source_release(src);
+		obs_leave_graphics();
+	}
+	for (int i = 0; i < MAX_ITEMS; ++i)
+		if (r->gpu[i].resolve_wait > 0.0f)
+			r->gpu[i].resolve_wait -= seconds;
+
+	cfg = r->cfg;
+	if (!cfg)
+		return;
+
+	if (os_atomic_set_long(&r->reset_motion, 0)) {
+		r->motion_along = r->motion_perp = 0.0;
+		r->border_march = 0.0;
+	}
+
+	/* Integrated in double so speed and angle changes steer the motion
+	 * instead of teleporting it. The components are kept in the lattice
+	 * frame, so canvas rotation pivots on the anchor however far the
+	 * pattern has scrolled. */
+	double ang = (cfg->motion_angle_deg - cfg->canvas_rotation_deg) * (M_PI / 180.0);
+	double step = (double)cfg->motion_speed * (double)seconds;
+	r->motion_along += cos(ang) * step;
+	r->motion_perp += sin(ang) * step;
+	r->border_march += step;
+	r->wander_time = clat_fmod_pos(r->wander_time + seconds, CLAT_WANDER_PERIOD);
+
+	for (int i = 0; i < MAX_ITEMS; ++i) {
+		float tw, spin;
+		effective_speeds(cfg, &cfg->items[i], &tw, &spin);
+		struct cpat_gpu_item *g = &r->gpu[i];
+		g->twinkle_phase = clat_fmod_pos(g->twinkle_phase + (double)tw * seconds, CLAT_TWINKLE_PERIOD);
+		g->autorot_phase =
+			clat_fmod_pos(g->autorot_phase + (double)spin * (M_PI / 180.0) * seconds, CLAT_TWO_PI);
 	}
 }
 
-void cpat_border_corner_radii(const struct cpat_renderer *r, uint32_t w, uint32_t h, struct vec4 *outer,
-			      struct vec4 *inner)
+void cpat_renderer_show(struct cpat_renderer *r, bool showing)
 {
-	const struct cpat_border *b = &r->border;
-	float half_min = 0.5f * (float)(w < h ? w : h);
-	float rc = b->radius < 0.0f ? 0.0f : b->radius;
-	if (rc > half_min)
-		rc = half_min;
-	vec4_set(outer, rc, rc, rc, rc);
-	/* Each inner corner stays concentric with the outer one, shrunk by the
-	 * wider of the two sides meeting there. */
-	vec4_set(inner, fmaxf(rc - fmaxf(b->left, b->top), 0.0f), fmaxf(rc - fmaxf(b->right, b->top), 0.0f),
-		 fmaxf(rc - fmaxf(b->right, b->bottom), 0.0f), fmaxf(rc - fmaxf(b->left, b->bottom), 0.0f));
+	r->showing = showing;
+	for (int i = 0; i < MAX_ITEMS; ++i)
+		sync_child_refs(r, i);
 }
 
-static void set_effect_float(gs_effect_t *effect, const char *name, float v)
+void cpat_renderer_activate(struct cpat_renderer *r, bool active)
 {
-	gs_eparam_t *p = gs_effect_get_param_by_name(effect, name);
-	if (p)
-		gs_effect_set_float(p, v);
+	r->active = active;
+	for (int i = 0; i < MAX_ITEMS; ++i)
+		sync_child_refs(r, i);
 }
 
-static void set_effect_vec4(gs_effect_t *effect, const char *name, const struct vec4 *v)
-{
-	gs_eparam_t *p = gs_effect_get_param_by_name(effect, name);
-	if (p)
-		gs_effect_set_vec4(p, v);
-}
+/* ------------------------------------------------------------ drawing */
 
-static void set_border_uniforms(struct cpat_renderer *r, uint32_t w, uint32_t h)
+static void set_mask_uniforms(struct cpat_renderer *r, const struct cpat_config *cfg, uint32_t w, uint32_t h)
 {
-	const struct cpat_border *b = &r->border;
-	set_effect_float(r->effect, "border_active", b->active ? 1.0f : 0.0f);
-	/* Set the rest even when inactive: the shaders only skip them behind a
-	 * runtime branch, so they stay live and D3D11 refuses to draw ("Not all
-	 * shader parameters were set") until every one has a value. */
-	struct vec4 widths, outer, inner;
-	vec4_set(&widths, b->left, b->top, b->right, b->bottom);
-	cpat_border_corner_radii(r, w, h, &outer, &inner);
-	set_effect_vec4(r->effect, "border_widths", &widths);
-	set_effect_float(r->effect, "border_radius", outer.x);
-	set_effect_vec4(r->effect, "border_inner_radii", &inner);
-	set_effect_float(r->effect, "border_softness", b->softness);
+	const struct cfx_effect *fx = &r->fx;
+	cfx_set_vec2(fx, P_CANVAS_SIZE, (float)w, (float)h);
+
+	float min_dim = (float)(w < h ? w : h);
+	cfx_set_float(fx, P_VIGNETTE_ENABLED, cfg->vignette_enabled ? 1.0f : 0.0f);
+	cfx_set_vec2(fx, P_VIGNETTE_CENTER, cfg->vignette_anchor_x_pct / 100.0f * (float)w,
+		     cfg->vignette_anchor_y_pct / 100.0f * (float)h);
+	cfx_set_float(fx, P_VIGNETTE_SIZE_PX, cfg->vignette_size * 0.5f * min_dim);
+	cfx_set_float(fx, P_VIGNETTE_DIRECTION, cfg->vignette_direction_deg * (float)(M_PI / 180.0));
+	cfx_set_float(fx, P_VIGNETTE_SHAPE, (float)cfg->vignette_shape);
+	cfx_set_float(fx, P_VIGNETTE_POLYGON_SIDES, cfg->vignette_polygon_sides);
+	cfx_set_float(fx, P_VIGNETTE_SOFTNESS, cfg->vignette_softness);
+	cfx_set_float(fx, P_VIGNETTE_INVERTED, cfg->vignette_inverted ? 1.0f : 0.0f);
+
+	/* Set even when inactive: D3D11 refuses to draw until every uniform
+	 * a shader references has a value. */
+	const struct cpat_border *b = &cfg->border;
+	struct vec4 outer, inner;
+	cpat_border_corner_radii(b, w, h, &outer, &inner);
+	cfx_set_float(fx, P_BORDER_ACTIVE, b->active ? 1.0f : 0.0f);
 	/* A masked lattice would cover the whole source, so it always clips. */
-	set_effect_float(r->effect, "border_clip", (b->clip || b->layout == CBORDER_MASKED) ? 1.0f : 0.0f);
-	set_effect_float(r->effect, "border_rows", (float)b->rows);
-	set_effect_float(r->effect, "border_stagger", b->stagger_rows ? 1.0f : 0.0f);
-	set_effect_float(r->effect, "border_align", b->align ? 1.0f : 0.0f);
-	set_effect_float(r->effect, "border_march", (float)r->border_march);
+	cfx_set_float(fx, P_BORDER_CLIP, (b->clip || b->layout == CBORDER_MASKED) ? 1.0f : 0.0f);
+	cfx_set_vec4f(fx, P_BORDER_WIDTHS, b->left, b->top, b->right, b->bottom);
+	cfx_set_float(fx, P_BORDER_RADIUS, outer.x);
+	cfx_set_vec4(fx, P_BORDER_INNER_RADII, &inner);
+	cfx_set_float(fx, P_BORDER_SOFTNESS, b->softness);
 }
 
 void cpat_renderer_render_background(struct cpat_renderer *r, uint32_t w, uint32_t h)
 {
-	if (!r->has_background || !r->effect || w == 0 || h == 0)
+	const struct cpat_config *cfg = r->cfg;
+	if (!cfg || !cfg->has_background || !r->fx.effect || w == 0 || h == 0)
 		return;
-	struct vec2 canvas = {(float)w, (float)h};
-	float ang = r->background_angle_deg * (float)(M_PI / 180.0);
-	struct vec2 dir = {cosf(ang), sinf(ang)};
-	gs_eparam_t *p;
-	p = gs_effect_get_param_by_name(r->effect, "canvas_size");
-	if (p)
-		gs_effect_set_vec2(p, &canvas);
-	p = gs_effect_get_param_by_name(r->effect, "bg_color");
-	if (p)
-		gs_effect_set_vec4(p, &r->background_color);
-	p = gs_effect_get_param_by_name(r->effect, "bg_color2");
-	if (p)
-		gs_effect_set_vec4(p, &r->background_color2);
-	p = gs_effect_get_param_by_name(r->effect, "bg_type");
-	if (p)
-		gs_effect_set_float(p, (float)r->background_type);
-	p = gs_effect_get_param_by_name(r->effect, "bg_dir");
-	if (p)
-		gs_effect_set_vec2(p, &dir);
-	set_border_uniforms(r, w, h);
+	const struct cfx_effect *fx = &r->fx;
+	set_mask_uniforms(r, cfg, w, h);
+	float ang = cfg->background_angle_deg * (float)(M_PI / 180.0);
+	cfx_set_vec4(fx, P_BG_COLOR, &cfg->background_color);
+	cfx_set_vec4(fx, P_BG_COLOR2, &cfg->background_color2);
+	cfx_set_float(fx, P_BG_TYPE, (float)cfg->background_type);
+	cfx_set_vec2(fx, P_BG_DIR, cosf(ang), sinf(ang));
 
-	gs_blend_state_push();
-	gs_blend_function(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA);
-	while (gs_effect_loop(r->effect, "DrawBackground"))
+	struct cfx_draw_state st;
+	cfx_draw_begin(&st);
+	while (gs_effect_loop(fx->effect, "DrawBackground"))
 		gs_draw_sprite(NULL, 0, w, h);
-	gs_blend_state_pop();
+	cfx_draw_end(&st);
 }
 
-static void render_item_source_to_texrender(struct cpat_item *it)
+/* Renders each used source once per frame, even when several items share
+ * it. Skipped while this pattern is already drawing its sources: a source
+ * that (through other patterns) contains this one would otherwise recurse
+ * until the stack overflows. */
+static void render_item_sources(struct cpat_renderer *r, const struct cpat_config *cfg, uint32_t count)
 {
-	if (!it->source_ref || !it->source_texrender)
+	for (uint32_t i = 0; i < MAX_ITEMS; ++i)
+		r->gpu[i].frame_texture = NULL;
+	if (r->rendering_sources)
 		return;
-	obs_source_t *src = obs_weak_source_get_source(it->source_ref);
-	if (!src)
-		return;
-	uint32_t sw = obs_source_get_base_width(src);
-	uint32_t sh = obs_source_get_base_height(src);
-	if (sw == 0 || sh == 0) {
+	r->rendering_sources = true;
+	for (uint32_t i = 0; i < count; ++i) {
+		struct cpat_gpu_item *g = &r->gpu[i];
+		if (!cfg->items[i].enabled || cfg->items[i].kind != CITEM_SOURCE || !g->source || !g->texrender)
+			continue;
+		for (uint32_t j = 0; j < i; ++j) {
+			if (r->gpu[j].frame_texture && r->gpu[j].source == g->source) {
+				g->frame_texture = r->gpu[j].frame_texture;
+				break;
+			}
+		}
+		if (g->frame_texture)
+			continue;
+		obs_source_t *src = obs_weak_source_get_source(g->source);
+		if (!src)
+			continue;
+		uint32_t sw = obs_source_get_width(src);
+		uint32_t sh = obs_source_get_height(src);
+		if (sw && sh) {
+			gs_texrender_reset(g->texrender);
+			if (gs_texrender_begin(g->texrender, sw, sh)) {
+				struct vec4 clear;
+				vec4_zero(&clear);
+				gs_clear(GS_CLEAR_COLOR, &clear, 0.0f, 0);
+				gs_ortho(0.0f, (float)sw, 0.0f, (float)sh, -100.0f, 100.0f);
+				gs_blend_state_push();
+				gs_blend_function_separate(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA, GS_BLEND_ONE,
+							   GS_BLEND_INVSRCALPHA);
+				obs_source_video_render(src);
+				gs_blend_state_pop();
+				gs_texrender_end(g->texrender);
+				g->frame_texture = gs_texrender_get_texture(g->texrender);
+			}
+		}
 		obs_source_release(src);
-		return;
 	}
-	gs_texrender_reset(it->source_texrender);
-	if (gs_texrender_begin(it->source_texrender, sw, sh)) {
-		struct vec4 clear;
-		vec4_zero(&clear);
-		gs_clear(GS_CLEAR_COLOR, &clear, 0.0f, 0);
-		gs_ortho(0.0f, (float)sw, 0.0f, (float)sh, -100.0f, 100.0f);
-		obs_source_video_render(src);
-		gs_texrender_end(it->source_texrender);
-		it->source_w = sw;
-		it->source_h = sh;
-	}
-	obs_source_release(src);
+	r->rendering_sources = false;
 }
 
-static void set_common_uniforms(struct cpat_renderer *r, struct cpat_item *it, uint32_t w, uint32_t h, int index,
-				uint32_t step_index, uint32_t step_count, float shared_density)
+/* Quad half extents of the item's shape in its own frame, the axis a line
+ * runs along (lines span their whole cell), and how far the quad reaches. */
+static void item_quad(const struct cpat_item_cfg *it, gs_texture_t *tex, float cell, struct vec2 *half,
+		      float *line_axis, float *reach)
 {
-	gs_eparam_t *p;
-	struct vec2 canvas = {(float)w, (float)h};
-	p = gs_effect_get_param_by_name(r->effect, "canvas_size");
-	if (p)
-		gs_effect_set_vec2(p, &canvas);
+	*line_axis = 0.0f;
+	if (it->kind != CITEM_SHAPE) {
+		float hx = it->size * 0.5f, hy = it->size * 0.5f;
+		uint32_t tw = tex ? gs_texture_get_width(tex) : 0;
+		uint32_t th = tex ? gs_texture_get_height(tex) : 0;
+		if (it->keep_aspect && tw && th) {
+			float aspect = (float)tw / (float)th;
+			if (aspect >= 1.0f)
+				hy /= aspect;
+			else
+				hx *= aspect;
+		}
+		vec2_set(half, hx, hy);
+	} else {
+		/* The heart reaches a little past the half size; everything
+		 * else fits inside it. Outlines add half their stroke. */
+		float r = it->size * (it->shape == CSHAPE_HEART ? 0.6f : 0.5f);
+		if (it->outline_only)
+			r += it->stroke_thickness * it->size * 0.5f;
+		r += 2.0f;
+		vec2_set(half, r, r);
+		if (it->shape == CSHAPE_HLINE) {
+			*line_axis = 1.0f;
+			half->x = cell * 0.5f;
+		} else if (it->shape == CSHAPE_VLINE) {
+			*line_axis = 2.0f;
+			half->y = cell * 0.5f;
+		}
+	}
+	*reach = sqrtf(half->x * half->x + half->y * half->y);
+}
 
-	bool shared_grid = (r->layout_mode == CLAYOUT_STEP_REPEAT || r->layout_mode == CLAYOUT_GRID);
-	float density = shared_grid ? shared_density : it->density;
-	if (density <= 0.0f)
-		density = 0.1f;
-	float cell = 100.0f / density;
-	if (cell < 2.0f)
-		cell = 2.0f;
-	/* Every item shares the same anchor so layered items stack on the same
-	 * origin points instead of being offset from each other. */
-	float anchor_x = (r->anchor_x_pct / 100.0f) * canvas.x;
-	float anchor_y = (r->anchor_y_pct / 100.0f) * canvas.y;
-	struct vec2 anchor = {anchor_x, anchor_y};
-	p = gs_effect_get_param_by_name(r->effect, "anchor");
-	if (p)
-		gs_effect_set_vec2(p, &anchor);
+static void set_item_uniforms(struct cpat_renderer *r, const struct cpat_config *cfg, int i, float cell,
+			      const struct vec2 *half, float line_axis, uint32_t step_index, uint32_t step_count)
+{
+	const struct cfx_effect *fx = &r->fx;
+	const struct cpat_item_cfg *it = &cfg->items[i];
+	const struct cpat_gpu_item *g = &r->gpu[i];
+	float item_seed = (float)i * 17.31f;
 
-	p = gs_effect_get_param_by_name(r->effect, "cell_size");
-	if (p)
-		gs_effect_set_float(p, cell);
-	p = gs_effect_get_param_by_name(r->effect, "shape_size");
-	if (p)
-		gs_effect_set_float(p, it->size);
-	float rot = it->rotation_deg * (float)(M_PI / 180.0);
-	p = gs_effect_get_param_by_name(r->effect, "shape_rotation");
-	if (p)
-		gs_effect_set_float(p, rot);
-	struct vec2 ioff = {it->offset_x, it->offset_y};
-	p = gs_effect_get_param_by_name(r->effect, "item_offset");
-	if (p)
-		gs_effect_set_vec2(p, &ioff);
+	cfx_set_float(fx, P_CELL_SIZE, cell);
+	cfx_set_float(fx, P_ITEM_SEED, item_seed);
+	cfx_set_float(fx, P_WANDER_AMT, cfg->location_drift ? cfg->location_drift_amount : 0.0f);
+	cfx_set_float(fx, P_WANDER_TIME, (float)r->wander_time);
+
+	float tw_amount = 0.0f;
+	if (it->twinkle_mode == CTWINKLE_CUSTOM)
+		tw_amount = it->twinkle_amount;
+	else if (it->twinkle_mode == CTWINKLE_GLOBAL && cfg->twinkle_enabled)
+		tw_amount = cfg->twinkle_amount;
+	cfx_set_float(fx, P_TWINKLE_AMOUNT, tw_amount);
+	cfx_set_float(fx, P_TWINKLE_PHASE, (float)g->twinkle_phase);
+
+	/* Auto rotation always scatters random per-cell angles when active;
+	 * only Unison adds the shared spin (integrated in tick). */
+	bool ar_active = false;
+	float ar_seed = 0.0f;
+	if (it->autorot_mode == CAROT_CUSTOM) {
+		ar_active = true;
+		ar_seed = it->autorot_seed;
+	} else if (it->autorot_mode == CAROT_GLOBAL && cfg->autorot_enabled) {
+		ar_active = true;
+		ar_seed = cfg->autorot_seed;
+	}
+	cfx_set_float(fx, P_AUTO_ROT_ACTIVE, ar_active ? 1.0f : 0.0f);
+	cfx_set_float(fx, P_AUTO_ROT_PHASE, ar_active ? (float)g->autorot_phase : 0.0f);
+	cfx_set_float(fx, P_AUTO_ROT_SEED, ar_seed);
+
+	/* The shared seed keeps every item's rows drifting in unison when
+	 * following the global setting; Custom uses the item's own seed. */
+	float sd_amount = 0.0f, sd_seed = 0.0f;
+	if (it->speed_drift_mode == CSDRIFT_CUSTOM) {
+		sd_amount = it->speed_drift_amount;
+		sd_seed = item_seed;
+	} else if (it->speed_drift_mode == CSDRIFT_GLOBAL && cfg->speed_drift) {
+		sd_amount = cfg->speed_drift_amount;
+	}
+	cfx_set_float(fx, P_DRIFT_SPEED_AMT, sd_amount);
+	cfx_set_float(fx, P_DRIFT_SPEED_SEED, sd_seed);
+	cfx_set_float(fx, P_ALT_LINES, cfg->alternating_lines ? 1.0f : 0.0f);
+	cfx_set_float(fx, P_BRICK, cfg->layout_mode == CLAYOUT_STEP_REPEAT ? 1.0f : 0.0f);
+
+	cfx_set_float(fx, P_LAYOUT_MODE, (float)cfg->layout_mode);
+	cfx_set_float(fx, P_GRID_RANDOM, cfg->grid_order == CGRID_ORDERED ? 0.0f : 1.0f);
+	cfx_set_float(fx, P_STEP_INDEX, (float)step_index);
+	cfx_set_float(fx, P_STEP_COUNT, (float)step_count);
+
+	cfx_set_float(fx, P_SHAPE_KIND, (float)it->shape);
+	cfx_set_float(fx, P_POLYGON_SIDES, it->polygon_sides);
+	cfx_set_float(fx, P_STROKE_THICKNESS, it->stroke_thickness);
+	cfx_set_float(fx, P_OUTLINE_ONLY, it->outline_only ? 1.0f : 0.0f);
+	cfx_set_float(fx, P_SHAPE_SIZE, it->size);
+	cfx_set_float(fx, P_SHAPE_ROTATION, it->rotation_deg * (float)(M_PI / 180.0));
+	cfx_set_vec2(fx, P_QUAD_HALF, half->x, half->y);
+	cfx_set_float(fx, P_LINE_AXIS, line_axis);
+
 	/* Shapes use their own color. Images and sources pass the tint color
-	 * with the opacity slider as alpha; the shader decides how the tint
-	 * applies from image_color_mode. */
+	 * with the opacity as alpha; the shader applies the tint per
+	 * image_color_mode. */
 	struct vec4 color = it->color;
 	if (it->kind != CITEM_SHAPE) {
 		color = it->image_tint;
 		color.w = it->image_opacity;
 	}
-	p = gs_effect_get_param_by_name(r->effect, "shape_color");
-	if (p)
-		gs_effect_set_vec4(p, &color);
-	p = gs_effect_get_param_by_name(r->effect, "image_color_mode");
-	if (p)
-		gs_effect_set_float(p, (float)it->image_color_mode);
-	p = gs_effect_get_param_by_name(r->effect, "color_variation");
-	if (p)
-		gs_effect_set_float(p, it->random_colors ? 1.0f : 0.0f);
-	p = gs_effect_get_param_by_name(r->effect, "color_b");
-	if (p)
-		gs_effect_set_vec4(p, &it->color_b);
-	p = gs_effect_get_param_by_name(r->effect, "color_c");
-	if (p)
-		gs_effect_set_vec4(p, &it->color_c);
-	p = gs_effect_get_param_by_name(r->effect, "shape_kind");
-	if (p)
-		gs_effect_set_int(p, it->shape);
-	p = gs_effect_get_param_by_name(r->effect, "polygon_sides");
-	if (p)
-		gs_effect_set_int(p, it->polygon_sides);
-	p = gs_effect_get_param_by_name(r->effect, "stroke_thickness");
-	if (p)
-		gs_effect_set_float(p, it->stroke_thickness);
-	p = gs_effect_get_param_by_name(r->effect, "outline_only");
-	if (p)
-		gs_effect_set_float(p, it->outline_only ? 1.0f : 0.0f);
+	cfx_set_vec4(fx, P_SHAPE_COLOR, &color);
+	cfx_set_float(fx, P_COLOR_VARIATION, it->random_colors ? 1.0f : 0.0f);
+	cfx_set_vec4(fx, P_COLOR_B, &it->color_b);
+	cfx_set_vec4(fx, P_COLOR_C, &it->color_c);
+	cfx_set_float(fx, P_IMAGE_COLOR_MODE, it->kind == CITEM_SHAPE ? 0.0f : (float)it->image_color_mode);
+}
 
-	/* The lattice axes come from the canvas rotation; motion is passed in
-	 * lattice coordinates (along-row, cross-row) so the accumulated scroll
-	 * rotates with the lattice around the anchor. */
-	float crot = r->canvas_rotation_deg * (float)(M_PI / 180.0);
-	struct vec2 ldir = {cosf(crot), sinf(crot)};
-	p = gs_effect_get_param_by_name(r->effect, "lattice_dir");
-	if (p)
-		gs_effect_set_vec2(p, &ldir);
-	struct vec2 moff = {(float)r->motion_off_along, (float)r->motion_off_perp};
-	p = gs_effect_get_param_by_name(r->effect, "motion_offset");
-	if (p)
-		gs_effect_set_vec2(p, &moff);
-	p = gs_effect_get_param_by_name(r->effect, "alt_lines");
-	if (p)
-		gs_effect_set_float(p, r->alternating_lines ? 1.0f : 0.0f);
-	float item_seed = (float)index * 17.31f;
-	/* The shared seed keeps every item's rows drifting in unison when
-	 * following the global setting; Custom uses the item's own seed and
-	 * amount so its lines drift independently of the other items. */
-	float sd_amount = 0.0f;
-	float sd_seed = 0.0f;
+static void draw_instances(struct cpat_renderer *r, const char *technique, uint32_t instances)
+{
+	gs_load_vertexbuffer(NULL);
+	gs_load_indexbuffer(NULL);
+	while (gs_effect_loop(r->fx.effect, technique))
+		gs_draw(GS_TRIS, 0, instances * 6);
+}
+
+static bool overdraw_ok(struct cpat_renderer *r, int i, double instances, const struct vec2 *half, uint32_t w,
+			uint32_t h)
+{
+	double area = instances * 4.0 * half->x * half->y;
+	if (instances <= MAX_INSTANCES && area <= MAX_OVERDRAW * (double)w * (double)h)
+		return true;
+	uint64_t bit = 1ull << i;
+	if (!(r->overdraw_warned & bit))
+		obs_log(LOG_WARNING,
+			"'%s' item %d: its shapes are too large for its density and would cover the canvas about "
+			"%.0f times over; skipping it. Lower the size or the density.",
+			obs_source_get_name(r->owner), i + 1, area / ((double)w * (double)h));
+	r->overdraw_warned |= bit;
+	return false;
+}
+
+/* Everything one item's draws need. */
+struct item_draw {
+	const struct cpat_config *cfg;
+	int index;
+	float cell;
+	struct vec2 half;
+	float line_axis;
+	float reach;
+	uint32_t step_index, step_count;
+	gs_texture_t *texture;
+	const char *technique;
+	uint32_t w, h;
+};
+
+/* Unused by one draw path but referenced by the shared vertex shader, so
+ * they need a value too. */
+static void set_placement_defaults(struct cpat_renderer *r)
+{
+	const struct cfx_effect *fx = &r->fx;
+	struct vec4 zero;
+	vec4_zero(&zero);
+	cfx_set_float(fx, P_BORDER_MODE, 0.0f);
+	cfx_set_vec2(fx, P_ORIGIN, 0.0f, 0.0f);
+	cfx_set_vec2(fx, P_LATTICE_DIR, 1.0f, 0.0f);
+	cfx_set_float(fx, P_ROW_FIRST, 0.0f);
+	cfx_set_float(fx, P_COL_COUNT, 1.0f);
+	cfx_set_float(fx, P_ALONG_MIN, 0.0f);
+	cfx_set_float(fx, P_ROW_WRAP, 0.0f);
+	cfx_set_float(fx, P_PERP_FRAC, 0.0f);
+	cfx_set_float(fx, P_COL_CELLS, 0.0f);
+	cfx_set_float(fx, P_COL_FRAC, 0.0f);
+	cfx_set_float(fx, P_COL_PERIOD, 2048.0f);
+	cfx_set_vec4(fx, P_ROW_BOX, &zero);
+	cfx_set_vec4(fx, P_ROW_RAD, &zero);
+	cfx_set_vec4(fx, P_ROW_NS, &zero);
+	cfx_set_vec4(fx, P_ROW_NA, &zero);
+	cfx_set_float(fx, P_ROW_TOTAL, 1.0f);
+	cfx_set_float(fx, P_ROW_INDEX, 0.0f);
+	cfx_set_float(fx, P_ROW_PHASE, 0.0f);
+	cfx_set_float(fx, P_BORDER_ALIGN, 0.0f);
+	cfx_set_float(fx, P_OFFSET_INWARD, 0.0f);
+	cfx_set_float(fx, P_RING_MODE, 0.0f);
+}
+
+/* Every effect parameter is cleared when a technique ends (each
+ * gs_effect_loop), so each draw uploads the complete state again: a
+ * parameter left unset either fails the draw (D3D11, OpenGL) or silently
+ * keeps another draw's value. */
+static void prepare_draw(struct cpat_renderer *r, const struct item_draw *d)
+{
+	set_mask_uniforms(r, d->cfg, d->w, d->h);
+	set_placement_defaults(r);
+	set_item_uniforms(r, d->cfg, d->index, d->cell, &d->half, d->line_axis, d->step_index, d->step_count);
+	if (d->texture && r->fx.params[P_CELL_TEXTURE])
+		gs_effect_set_texture_srgb(r->fx.params[P_CELL_TEXTURE], d->texture);
+}
+
+static void draw_lattice_item(struct cpat_renderer *r, const struct item_draw *d)
+{
+	const struct cfx_effect *fx = &r->fx;
+	const struct cpat_config *cfg = d->cfg;
+	const struct cpat_item_cfg *it = &cfg->items[d->index];
+	const float cell = d->cell;
+
+	float crot = cfg->canvas_rotation_deg * (float)(M_PI / 180.0);
+	float dir_x = cosf(crot), dir_y = sinf(crot);
+	float ox = cfg->anchor_x_pct / 100.0f * (float)d->w + it->offset_x;
+	float oy = cfg->anchor_y_pct / 100.0f * (float)d->h + it->offset_y;
+
+	float row_wrap, perp_frac, col_cells, col_frac;
+	float period = clat_col_period(cfg->layout_mode == CLAYOUT_LAYERED ? 1 : d->step_count);
+	clat_split_rows(r->motion_perp, cell, &row_wrap, &perp_frac);
+	clat_split_cols(r->motion_along, cell, period, &col_cells, &col_frac);
+
+	float wander = cfg->location_drift ? cfg->location_drift_amount * cell : 0.0f;
+	struct clat_range rg;
+	clat_visible_range((float)d->w, (float)d->h, ox, oy, dir_x, dir_y, cell, d->reach + wander + 1.0f, perp_frac,
+			   &rg);
+
+	double instances = (double)rg.row_count * (double)rg.col_count;
+	double owned = cfg->layout_mode == CLAYOUT_LAYERED ? instances : instances / (double)d->step_count;
+	if (instances < 1.0 || instances > MAX_INSTANCES || !overdraw_ok(r, d->index, owned, &d->half, d->w, d->h))
+		return;
+
+	prepare_draw(r, d);
+	cfx_set_vec2(fx, P_ORIGIN, ox, oy);
+	cfx_set_vec2(fx, P_LATTICE_DIR, dir_x, dir_y);
+	cfx_set_float(fx, P_ROW_FIRST, rg.row_first);
+	cfx_set_float(fx, P_COL_COUNT, rg.col_count);
+	cfx_set_float(fx, P_ALONG_MIN, rg.along_min);
+	cfx_set_float(fx, P_ROW_WRAP, row_wrap);
+	cfx_set_float(fx, P_PERP_FRAC, perp_frac);
+	cfx_set_float(fx, P_COL_CELLS, col_cells);
+	cfx_set_float(fx, P_COL_FRAC, col_frac);
+	cfx_set_float(fx, P_COL_PERIOD, period);
+	draw_instances(r, d->technique, (uint32_t)instances);
+}
+
+static void draw_border_item(struct cpat_renderer *r, const struct item_draw *d)
+{
+	const struct cfx_effect *fx = &r->fx;
+	const struct cpat_config *cfg = d->cfg;
+	const struct cpat_item_cfg *it = &cfg->items[d->index];
+	const struct cpat_border *b = &cfg->border;
+	const float cell = d->cell;
+
+	struct clat_border_frame fr = {.w = (float)d->w,
+				       .h = (float)d->h,
+				       .widths = {b->left, b->top, b->right, b->bottom}};
+	clat_border_radii(fr.w, fr.h, fr.widths, b->radius, &fr.radius, fr.inner_radii);
+
+	float sd_amount = 0.0f, sd_seed = 0.0f;
 	if (it->speed_drift_mode == CSDRIFT_CUSTOM) {
 		sd_amount = it->speed_drift_amount;
-		sd_seed = item_seed;
-	} else if (it->speed_drift_mode == CSDRIFT_GLOBAL && r->speed_drift) {
-		sd_amount = r->speed_drift_amount;
+		sd_seed = (float)d->index * 17.31f;
+	} else if (it->speed_drift_mode == CSDRIFT_GLOBAL && cfg->speed_drift) {
+		sd_amount = cfg->speed_drift_amount;
 	}
-	p = gs_effect_get_param_by_name(r->effect, "drift_speed_amt");
-	if (p)
-		gs_effect_set_float(p, sd_amount);
-	p = gs_effect_get_param_by_name(r->effect, "drift_speed_seed");
-	if (p)
-		gs_effect_set_float(p, sd_seed);
-	p = gs_effect_get_param_by_name(r->effect, "drift_loc_amt");
-	if (p)
-		gs_effect_set_float(p, r->location_drift ? r->location_drift_amount : 0.0f);
-	p = gs_effect_get_param_by_name(r->effect, "item_seed");
-	if (p)
-		gs_effect_set_float(p, item_seed);
-	p = gs_effect_get_param_by_name(r->effect, "elapsed_time");
-	if (p)
-		gs_effect_set_float(p, (float)r->elapsed_time);
 
-	float tw_amount = 0.0f;
-	float tw_speed = 1.0f;
-	if (it->twinkle_mode == CTWINKLE_CUSTOM) {
-		tw_amount = it->twinkle_amount;
-		tw_speed = it->twinkle_speed;
-	} else if (it->twinkle_mode == CTWINKLE_GLOBAL && r->twinkle_enabled) {
-		tw_amount = r->twinkle_amount;
-		tw_speed = r->twinkle_speed;
+	/* A horizontal line turned to follow the frame is drawn as one
+	 * continuous ring per row, so it bends around rounded corners. */
+	const bool ring = it->kind == CITEM_SHAPE && it->shape == CSHAPE_HLINE && b->align;
+	struct item_draw rd = *d;
+	if (ring) {
+		vec2_set(&rd.half, (float)d->w * 0.5f + 2.0f, (float)d->h * 0.5f + 2.0f);
+		rd.line_axis = 0.0f;
 	}
-	p = gs_effect_get_param_by_name(r->effect, "twinkle_amount");
-	if (p)
-		gs_effect_set_float(p, tw_amount);
-	p = gs_effect_get_param_by_name(r->effect, "twinkle_speed");
-	if (p)
-		gs_effect_set_float(p, tw_speed);
 
-	/* Auto rotation always scatters random per-cell angles when active;
-	 * only the Unison style adds a shared continuous spin, so Random
-	 * passes a speed of zero and the shapes hold their random angles. */
-	bool ar_active = false;
-	float ar_speed = 0.0f;
-	float ar_seed = 0.0f;
-	if (it->autorot_mode == CAROT_CUSTOM) {
-		ar_active = true;
-		if (it->autorot_style == CAROT_STYLE_UNISON)
-			ar_speed = it->autorot_speed;
-		ar_seed = it->autorot_seed;
-	} else if (it->autorot_mode == CAROT_GLOBAL && r->autorot_enabled) {
-		ar_active = true;
-		if (r->autorot_style == CAROT_STYLE_UNISON)
-			ar_speed = r->autorot_speed;
-		ar_seed = r->autorot_seed;
+	for (int j = 0; j < b->rows; ++j) {
+		struct clat_border_row row;
+		clat_border_make_row(&fr, ((float)j + 0.5f) / (float)b->rows, cell, &row);
+		float instances = ring ? 1.0f : row.total;
+		if (row.total < 0.5f || !overdraw_ok(r, d->index, instances, &rd.half, d->w, d->h))
+			continue;
+		double phase = clat_border_row_phase(r->border_march, (float)j, cell, it->offset_x,
+						     cfg->alternating_lines, sd_amount, sd_seed, b->stagger_rows,
+						     row.total);
+		prepare_draw(r, &rd);
+		cfx_set_float(fx, P_BORDER_MODE, 1.0f);
+		cfx_set_float(fx, P_RING_MODE, ring ? 1.0f : 0.0f);
+		cfx_set_float(fx, P_BORDER_ALIGN, b->align ? 1.0f : 0.0f);
+		cfx_set_float(fx, P_OFFSET_INWARD, it->offset_y);
+		cfx_set_vec4f(fx, P_ROW_BOX, row.box[0], row.box[1], row.box[2], row.box[3]);
+		cfx_set_vec4f(fx, P_ROW_RAD, row.rad[0], row.rad[1], row.rad[2], row.rad[3]);
+		cfx_set_vec4f(fx, P_ROW_NS, row.ns[0], row.ns[1], row.ns[2], row.ns[3]);
+		cfx_set_vec4f(fx, P_ROW_NA, row.na[0], row.na[1], row.na[2], row.na[3]);
+		cfx_set_float(fx, P_ROW_TOTAL, row.total);
+		cfx_set_float(fx, P_ROW_INDEX, (float)j);
+		cfx_set_float(fx, P_ROW_PHASE, (float)phase);
+		draw_instances(r, d->technique, (uint32_t)instances);
 	}
-	p = gs_effect_get_param_by_name(r->effect, "auto_rot_active");
-	if (p)
-		gs_effect_set_float(p, ar_active ? 1.0f : 0.0f);
-	p = gs_effect_get_param_by_name(r->effect, "auto_rot_speed");
-	if (p)
-		gs_effect_set_float(p, ar_speed * (float)(M_PI / 180.0));
-	p = gs_effect_get_param_by_name(r->effect, "auto_rot_seed");
-	if (p)
-		gs_effect_set_float(p, ar_seed);
-
-	p = gs_effect_get_param_by_name(r->effect, "layout_mode");
-	if (p)
-		gs_effect_set_float(p, (float)r->layout_mode);
-	p = gs_effect_get_param_by_name(r->effect, "grid_random");
-	if (p)
-		gs_effect_set_float(p, (r->grid_order == CGRID_ORDERED) ? 0.0f : 1.0f);
-	p = gs_effect_get_param_by_name(r->effect, "step_index");
-	if (p)
-		gs_effect_set_float(p, (float)step_index);
-	p = gs_effect_get_param_by_name(r->effect, "step_count");
-	if (p)
-		gs_effect_set_float(p, (float)(step_count > 0 ? step_count : 1));
-
-	float min_dim = (canvas.x < canvas.y) ? canvas.x : canvas.y;
-	float vsz = r->vignette_size * 0.5f * min_dim;
-	struct vec2 vcenter = {(r->vignette_anchor_x_pct / 100.0f) * canvas.x,
-			       (r->vignette_anchor_y_pct / 100.0f) * canvas.y};
-	float vang = r->vignette_direction_deg * (float)(M_PI / 180.0);
-	p = gs_effect_get_param_by_name(r->effect, "vignette_enabled");
-	if (p)
-		gs_effect_set_float(p, r->vignette_enabled ? 1.0f : 0.0f);
-	p = gs_effect_get_param_by_name(r->effect, "vignette_center");
-	if (p)
-		gs_effect_set_vec2(p, &vcenter);
-	p = gs_effect_get_param_by_name(r->effect, "vignette_size_px");
-	if (p)
-		gs_effect_set_float(p, vsz);
-	p = gs_effect_get_param_by_name(r->effect, "vignette_direction");
-	if (p)
-		gs_effect_set_float(p, vang);
-	p = gs_effect_get_param_by_name(r->effect, "vignette_shape");
-	if (p)
-		gs_effect_set_int(p, r->vignette_shape);
-	p = gs_effect_get_param_by_name(r->effect, "vignette_polygon_sides");
-	if (p)
-		gs_effect_set_int(p, r->vignette_polygon_sides);
-	p = gs_effect_get_param_by_name(r->effect, "vignette_softness");
-	if (p)
-		gs_effect_set_float(p, r->vignette_softness);
-	p = gs_effect_get_param_by_name(r->effect, "vignette_inverted");
-	if (p)
-		gs_effect_set_float(p, r->vignette_inverted ? 1.0f : 0.0f);
 }
 
 void cpat_renderer_render_items(struct cpat_renderer *r, uint32_t w, uint32_t h)
 {
-	if (!r->effect || w == 0 || h == 0)
+	const struct cpat_config *cfg = r->cfg;
+	if (!cfg || !r->fx.effect || w == 0 || h == 0)
 		return;
+	uint32_t count = cfg->item_count;
 
-	uint32_t count = r->item_count;
-	if (count > CONSTELLATIONS_MAX_ITEMS)
-		count = CONSTELLATIONS_MAX_ITEMS;
-
+	/* Step and Repeat and Grid share one lattice, sized by the first
+	 * enabled item, and hand its cells out between the enabled items. */
 	uint32_t step_count = 0;
 	float shared_density = 2.0f;
-	if (r->layout_mode == CLAYOUT_STEP_REPEAT || r->layout_mode == CLAYOUT_GRID) {
-		for (uint32_t i = 0; i < count; ++i) {
-			if (r->items[i].enabled) {
-				if (step_count == 0)
-					shared_density = r->items[i].density;
-				step_count++;
-			}
-		}
-		if (step_count == 0)
-			step_count = 1;
-	}
-
 	for (uint32_t i = 0; i < count; ++i) {
-		struct cpat_item *it = &r->items[i];
+		if (cfg->items[i].enabled) {
+			if (step_count == 0)
+				shared_density = cfg->items[i].density;
+			step_count++;
+		}
+	}
+	if (step_count == 0)
+		return;
+
+	render_item_sources(r, cfg, count);
+
+	const bool perimeter = cfg->border.active && cfg->border.layout == CBORDER_PERIMETER;
+	const bool shared = cfg->layout_mode != CLAYOUT_LAYERED;
+
+	struct cfx_draw_state st;
+	cfx_draw_begin(&st);
+	uint32_t step_index = 0;
+	for (uint32_t i = 0; i < count; ++i) {
+		const struct cpat_item_cfg *it = &cfg->items[i];
 		if (!it->enabled)
 			continue;
-		if (it->kind == CITEM_SOURCE)
-			render_item_source_to_texrender(it);
-	}
-
-	set_border_uniforms(r, w, h);
-	const bool perimeter = r->border.active && r->border.layout == CBORDER_PERIMETER;
-
-	gs_blend_state_push();
-	gs_blend_function(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA);
-
-	uint32_t next_step_index = 0;
-	for (uint32_t i = 0; i < count; ++i) {
-		struct cpat_item *it = &r->items[i];
-		if (!it->enabled)
-			continue;
-		uint32_t this_step_index = next_step_index++;
-
-		gs_texture_t *tex = NULL;
-		const char *technique = perimeter ? "DrawBorderShape" : "DrawShape";
-		const char *image_technique = perimeter ? "DrawBorderImage" : "DrawImage";
-		if (it->kind == CITEM_IMAGE) {
-			tex = cpat_item_image_texture(it);
-			if (!tex)
+		struct item_draw d = {.cfg = cfg,
+				      .index = (int)i,
+				      .step_index = step_index++,
+				      .step_count = step_count,
+				      .technique = "DrawShape",
+				      .w = w,
+				      .h = h};
+		if (it->kind == CITEM_IMAGE)
+			d.texture = r->gpu[i].texture;
+		else if (it->kind == CITEM_SOURCE)
+			d.texture = r->gpu[i].frame_texture;
+		if (it->kind != CITEM_SHAPE) {
+			if (!d.texture)
 				continue;
-			technique = image_technique;
-		} else if (it->kind == CITEM_SOURCE) {
-			if (!it->source_texrender)
-				continue;
-			tex = gs_texrender_get_texture(it->source_texrender);
-			if (!tex)
-				continue;
-			technique = image_technique;
+			d.technique = "DrawImage";
 		}
+		float density = shared ? shared_density : it->density;
+		d.cell = fmaxf(100.0f / fmaxf(density, 0.1f), 2.0f);
+		item_quad(it, d.texture, d.cell, &d.half, &d.line_axis, &d.reach);
 
-		set_common_uniforms(r, it, w, h, (int)i, this_step_index, step_count, shared_density);
-
-		if (tex) {
-			gs_eparam_t *tp = gs_effect_get_param_by_name(r->effect, "cell_texture");
-			if (tp)
-				gs_effect_set_texture(tp, tex);
-			float aspect = 1.0f;
-			uint32_t tw = gs_texture_get_width(tex);
-			uint32_t th = gs_texture_get_height(tex);
-			if (it->keep_aspect && tw && th)
-				aspect = (float)tw / (float)th;
-			tp = gs_effect_get_param_by_name(r->effect, "tex_aspect");
-			if (tp)
-				gs_effect_set_float(tp, aspect);
-		}
-
-		while (gs_effect_loop(r->effect, technique))
-			gs_draw_sprite(NULL, 0, w, h);
+		if (perimeter)
+			draw_border_item(r, &d);
+		else
+			draw_lattice_item(r, &d);
 	}
+	cfx_draw_end(&st);
+}
 
-	gs_blend_state_pop();
+void cpat_renderer_draw_source_rounded(struct cpat_renderer *r, obs_source_t *filter, uint32_t w, uint32_t h,
+				       const struct vec4 *radii)
+{
+	cfx_set_vec2(&r->fx, P_SRC_SIZE, (float)w, (float)h);
+	cfx_set_vec4(&r->fx, P_SRC_RADII, radii);
+	obs_source_process_filter_tech_end(filter, r->fx.effect, w, h, "DrawSourceRounded");
+}
+
+/* ---------------------------------------------------------- lifecycle */
+
+struct cpat_renderer *cpat_renderer_create(obs_source_t *owner, enum cpat_host host, obs_data_t *settings)
+{
+	struct cpat_renderer *r = bzalloc(sizeof(*r));
+	r->owner = owner;
+	r->host = host;
+	pthread_mutex_init_value(&r->update_mutex);
+	pthread_mutex_init_value(&r->pending_mutex);
+	if (pthread_mutex_init(&r->update_mutex, NULL) != 0 || pthread_mutex_init(&r->pending_mutex, NULL) != 0) {
+		bfree(r);
+		return NULL;
+	}
+	cfx_effect_load(&r->fx, "pattern.effect", param_names, P_COUNT);
+	cpat_settings_migrate(settings);
+	cpat_renderer_update(r, settings);
+	return r;
+}
+
+void cpat_renderer_destroy(struct cpat_renderer *r)
+{
+	if (!r)
+		return;
+	obs_enter_graphics();
+	for (int i = 0; i < MAX_ITEMS; ++i) {
+		struct cpat_gpu_item *g = &r->gpu[i];
+		release_item_source(r, i);
+		if (g->texture)
+			gs_texture_destroy(g->texture);
+		bfree(g->media_key);
+		bfree(g->source_uuid);
+		bfree(g->source_name);
+	}
+	obs_leave_graphics();
+	config_free(r->cfg);
+	config_free(r->pending);
+	for (int i = 0; i < MAX_ITEMS; ++i) {
+		cpat_media_svg_free(r->svg_cache[i].svg);
+		bfree(r->svg_cache[i].path);
+		bfree(r->submitted_keys[i]);
+	}
+	cfx_effect_free(&r->fx);
+	pthread_mutex_destroy(&r->update_mutex);
+	pthread_mutex_destroy(&r->pending_mutex);
+	bfree(r);
+}
+
+void cpat_renderer_load(struct cpat_renderer *r, obs_data_t *settings)
+{
+	char key[64];
+	bool changed = false;
+	for (int i = 0; i < MAX_ITEMS; ++i)
+		changed |= !obs_data_has_user_value(settings, cpat_item_key(key, sizeof(key), i, "source")) &&
+			   *obs_data_get_string(settings, cpat_item_key(key, sizeof(key), i, "source_name"));
+	cpat_settings_migrate(settings);
+	if (changed)
+		cpat_renderer_update(r, settings);
+}
+
+uint32_t cpat_renderer_width(const struct cpat_renderer *r)
+{
+	return (uint32_t)os_atomic_load_long(&r->width);
+}
+
+uint32_t cpat_renderer_height(const struct cpat_renderer *r)
+{
+	return (uint32_t)os_atomic_load_long(&r->height);
+}
+
+obs_source_t *cpat_renderer_owner(const struct cpat_renderer *r)
+{
+	return r ? r->owner : NULL;
+}
+
+void cpat_renderer_request_motion_reset(struct cpat_renderer *r)
+{
+	if (r)
+		os_atomic_set_long(&r->reset_motion, 1);
 }

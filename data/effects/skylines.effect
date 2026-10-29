@@ -5,7 +5,10 @@ uniform float4x4 ViewProj;
 
 uniform float2 canvas_size;
 uniform float noise_seed;
-uniform float drift_px;         // accumulated horizontal slide (Location Drift)
+// Location Drift, split by the CPU into whole building slots (wrapped at
+// 4096 buildings) and the remaining px, so no large value reaches the GPU.
+uniform float drift_slots;
+uniform float drift_frac_px;
 uniform float height_variation; // 0 = uniform roofline, 1 = maximum randomness
 uniform float min_height;       // floor of the height range, fraction of canvas
 uniform float width_variation;  // 0 = even building widths, 1 = maximum jitter
@@ -16,7 +19,7 @@ uniform float4 building_color;
 uniform float4 window_on_color;
 uniform float4 window_off_color;
 uniform float twinkle_active; // 1 only when Window Twinkle is on and speed > 0
-uniform float twinkle_phase;  // accumulated twinkle cycles
+uniform float twinkle_phase;  // accumulated twinkle cycles, wrapped at 64
 
 struct VertData {
 	float4 pos : POSITION;
@@ -41,6 +44,27 @@ float shash2(float2 p)
 	return frac(sin(dot(p, float2(127.1, 311.7)) + noise_seed * 269.5) * 43758.5453);
 }
 
+float wrapf(float x, float m)
+{
+	float r = x - floor(x / m) * m;
+	if (r < 0.0)
+		r += m;
+	if (r >= m)
+		r -= m;
+	return r;
+}
+
+// Identity of the building in local slot i: buildings repeat every 4096.
+float bldg_id(float i)
+{
+	return wrapf(i + drift_slots, 4096.0);
+}
+
+float srgb_to_linear(float c)
+{
+	return (c <= 0.04045) ? (c / 12.92) : pow((c + 0.055) / 1.055, 2.4);
+}
+
 float boundary(float i, float slot_w)
 {
 	// Jittered slot borders give adjacent buildings varied widths while
@@ -49,7 +73,7 @@ float boundary(float i, float slot_w)
 	// Minimum Width floor tightens it further so no building can shrink
 	// below min_width of the base slot.
 	float amp = min(0.45 * saturate(width_variation), (1.0 - saturate(min_width)) * 0.5);
-	return (i + (shash(i) - 0.5) * 2.0 * amp) * slot_w;
+	return (i + (shash(bldg_id(i)) - 0.5) * 2.0 * amp) * slot_w;
 }
 
 float4 blend_over(float4 dst, float4 src)
@@ -66,7 +90,7 @@ float4 PSSkyline(VertData v_in) : TARGET
 	float2 frag_px = v_in.uv * canvas_size;
 	float ch = canvas_size.y;
 	float slot_w = 0.085 * ch;
-	float x = frag_px.x + drift_px;
+	float x = frag_px.x + drift_frac_px;
 	float yb = ch - frag_px.y; // height above the source's bottom edge
 
 	// Resolve which jittered slot this pixel falls in; the jitter never
@@ -93,7 +117,8 @@ float4 PSSkyline(VertData v_in) : TARGET
 	// toward 15%..95% as Building Height Variation approaches 1. The
 	// Minimum Height floor lifts the bottom of that range; heights stay
 	// uniformly distributed between the floor and the top.
-	float hr = frac(sin(bldg * 113.5 + noise_seed * 269.5 + 7.3) * 43758.5453);
+	float id = bldg_id(bldg);
+	float hr = frac(sin(id * 113.5 + noise_seed * 269.5 + 7.3) * 43758.5453);
 	float h_high = 0.55 + 0.4 * saturate(height_variation);
 	float h_low = max(0.55 - 0.4 * saturate(height_variation), saturate(min_height));
 	float h_px = lerp(h_low, max(h_high, h_low), hr) * ch;
@@ -105,7 +130,7 @@ float4 PSSkyline(VertData v_in) : TARGET
 	// Per-building shading keeps same-height neighbors readable. The
 	// Shade Variation slider sets the spread: 0 = uniform color, 1 =
 	// +/-50% brightness around the chosen building color.
-	float sr = frac(sin(bldg * 91.7 + noise_seed * 269.5 + 3.1) * 43758.5453);
+	float sr = frac(sin(id * 91.7 + noise_seed * 269.5 + 3.1) * 43758.5453);
 	float shade = 1.0 + (sr - 0.5) * saturate(shade_variation);
 	float4 outc = float4(saturate(building_color.rgb * shade), building_color.a);
 
@@ -123,12 +148,13 @@ float4 PSSkyline(VertData v_in) : TARGET
 
 	if (wl.x >= 0.0 && wl.y >= 0.0 && cell.x < ncols && cell.y < nrows &&
 	    cf.x > 0.20 && cf.x < 0.72 && cf.y > 0.22 && cf.y < 0.78) {
-		float2 wid = float2(bldg * 13.7 + cell.x, cell.y - bldg * 5.3);
+		float2 wid = float2(id * 13.7 + cell.x, cell.y - id * 5.3);
 		float occupied = step(shash2(wid), window_occupancy);
 		float lit = occupied;
 		if (twinkle_active > 0.5 && occupied > 0.5) {
 			// Per-window rate and phase offsets keep fades unsynchronized.
-			float rate = 0.6 + 1.4 * shash2(wid + 19.1);
+			// Rates are whole 64ths so the phase can wrap at 64 cycles.
+			float rate = (38.0 + floor(shash2(wid + 19.1) * 90.0)) / 64.0;
 			float ph = shash2(wid + 47.3);
 			lit = 0.5 + 0.5 * sin((twinkle_phase * rate + ph) * 6.2831853);
 		}
@@ -136,8 +162,11 @@ float4 PSSkyline(VertData v_in) : TARGET
 		outc = blend_over(outc, wc);
 	}
 
-	outc.a *= body_a;
-	return outc;
+	// Colors are mixed in sRGB like a paint program; the output is linear
+	// and premultiplied (see cfx_draw_begin).
+	float a = outc.a * body_a;
+	float3 lin = float3(srgb_to_linear(outc.r), srgb_to_linear(outc.g), srgb_to_linear(outc.b));
+	return float4(lin * a, a);
 }
 
 technique Draw

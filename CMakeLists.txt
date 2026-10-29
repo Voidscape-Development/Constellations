@@ -38,14 +38,16 @@ target_sources(
   ${CMAKE_PROJECT_NAME}
   PRIVATE
     src/plugin-main.c
+    src/common.c
+    src/lattice.c
+    src/pattern-media.c
     src/pattern-renderer.c
+    src/pattern-settings.c
     src/pattern-source.c
-    src/topography-source.c
-    src/skylines-source.c
     src/pattern-filter.c
     src/pattern-border.c
-    src/shapes-transition.c
-    src/svg-image.c
+    src/topography-source.c
+    src/skylines-source.c
     src/nanosvg-impl.c
 )
 

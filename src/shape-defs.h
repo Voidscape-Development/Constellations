@@ -51,36 +51,6 @@ enum constellations_vignette_shape {
 	CVIGN_POLYGON = 3,
 };
 
-enum constellations_transition_mode {
-	CTRANS_MODE_COVER = 0,
-	CTRANS_MODE_DISSOLVE = 1,
-	CTRANS_MODE_SHAPE_ZOOM = 2,
-	CTRANS_MODE_KEYHOLE = 3,
-};
-
-enum constellations_transition_type {
-	CTRANS_TYPE_DIRECTIONAL = 0,
-	CTRANS_TYPE_INSIDE_OUT = 1,
-	CTRANS_TYPE_OUTSIDE_IN = 2,
-	CTRANS_TYPE_MIRRORED = 3,
-};
-
-enum constellations_dissolve_type {
-	CDISSOLVE_CROP_SHRINK = 0,
-	CDISSOLVE_SCALE_SHRINK = 1,
-	CDISSOLVE_FADE = 2,
-};
-
-enum constellations_logo_display {
-	CLOGO_FADE = 0,
-	CLOGO_SLIDE = 1,
-};
-
-enum constellations_shape_zoom_dir {
-	CZOOM_IN = 0,
-	CZOOM_OUT = 1,
-};
-
 enum constellations_layout_mode {
 	CLAYOUT_LAYERED = 0,
 	CLAYOUT_STEP_REPEAT = 1,
@@ -115,11 +85,6 @@ enum constellations_autorot_style {
 	CAROT_STYLE_RANDOM = 1,
 };
 
-enum constellations_tiling_mode {
-	CTILE_GRID = 0,
-	CTILE_TIGHT = 1,
-};
-
 enum constellations_border_position {
 	CBORDER_INSIDE = 0,
 	CBORDER_OUTSIDE = 1,
@@ -143,4 +108,3 @@ void constellations_register_topography_filter(void);
 void constellations_register_skylines(void);
 void constellations_register_pattern_filter(void);
 void constellations_register_pattern_border(void);
-void constellations_register_shapes_transition(void);
