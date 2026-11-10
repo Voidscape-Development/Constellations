@@ -1,0 +1,169 @@
+/*
+ * Tiles - tiling scene transition for OBS Studio
+ *
+ * Every shape here tiles the plane edge to edge, so at full scale the tiles
+ * leave no uncovered pixel:
+ *
+ *   square    - unit square lattice
+ *   hexagon   - Voronoi cells of a triangular lattice (pointy-top hexagons)
+ *   triangle  - equilateral triangles, two per lattice rhombus
+ *   diamond   - a triangle joined to its mirror image along the base, so one
+ *               diamond per pair of triangles, on the same lattice
+ *   brick     - squat rectangles, every other row slid half a brick along
+ *   octagon   - regular octagons on a square lattice, with the square each
+ *               lattice corner is left standing on its point as a tile too
+ *   cairo     - the Cairo pentagon, four to a turn around each four-fold point
+ *   mosaic    - squares that quarter themselves, twice, on their own hash, so
+ *               the tiling mixes three tile sizes
+ *   shatter   - the Voronoi cells of a jittered lattice of seeds
+ *   circle    - circumscribed circles on the hexagonal lattice; they overshoot
+ *               the cell and overlap their neighbours to close the gaps
+ *
+ * Every tile grows by scaling about its own centre, so the metric of each
+ * shape is a gauge: homogeneous, 0 at the centre and 1 on the boundary. That
+ * is what makes coverage track the square of the scale for all of them, mixed
+ * tile sizes included, and what lets a shape be anything star shaped about its
+ * centre rather than only the regular polygons that tile on their own.
+ *
+ * The lattice, the sweep order and the tile clock are in tiles_math.effect,
+ * which test/test-tiling.cpp compiles too, so the tests check this geometry
+ * rather than a copy of it.
+ */
+
+uniform float4x4 ViewProj;
+uniform texture2d a_tex;
+uniform texture2d b_tex;
+
+uniform float2 canvas;     /* render target size, pixels */
+uniform float2 origin_px;  /* tiling origin, pixels */
+uniform float2 grid_rot;   /* cos/sin of the lattice rotation */
+uniform float2 dir_vec;    /* sweep axis, unit length */
+uniform float2 dir_range;  /* x: projection minimum, y: projection span */
+
+uniform float4 color_a;    /* gradient start */
+uniform float4 color_b;    /* gradient end */
+
+uniform float progress;    /* transition time, 0..1; linear, see ease_order() */
+uniform float tile_px;     /* lattice unit, pixels */
+uniform float edge;        /* antialiasing width, metric units */
+uniform float tile_dur;    /* per tile animation length, fraction of the sweep */
+uniform float band;        /* wave band thickness, fraction of the sweep */
+uniform float randomness;  /* 0 = ordered sweep, 1 = fully shuffled */
+uniform float variation;   /* per tile brightness jitter */
+
+uniform int easing;        /* 0 linear, 1 in-out, 2 out; shapes the launch order */
+uniform int mode;          /* 0 cover, 1 keyhole, 2 wave, 3 crop, 4 scale */
+uniform int shape;         /* 0 square, 1 circle, 2 hexagon, 3 triangle, 4 diamond,
+			      5 brick, 6 octagon, 7 cairo, 8 mosaic, 9 shatter */
+uniform int direction;     /* 0 in-out, 1 out-in, 2 mirror-in, 3 mirror-out, 4 angle */
+
+uniform bool invert;       /* keyhole: put the outgoing scene inside the tiles */
+uniform bool reverse_exit; /* cover: tiles leave in reverse order */
+uniform bool b_tiles;      /* dissolve: incoming scene arrives as tiles too */
+
+sampler_state textureSampler {
+	Filter   = Linear;
+	AddressU = Clamp;
+	AddressV = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData vert_out;
+	vert_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv = v_in.uv;
+	return vert_out;
+}
+
+#include "tiles_math.effect"
+
+/* ------------------------------------------------------------------ */
+
+float4 PSTiles(VertData v_in) : TARGET
+{
+	float2 uv = v_in.uv;
+	Tile tile = best_tile(to_lattice(uv * canvas));
+
+	if (mode == 0 || mode == 2) {
+		float4 scene = (tile.on_b > 0.5) ? b_tex.Sample(textureSampler, uv)
+						 : a_tex.Sample(textureSampler, uv);
+		return lerp(scene, tile_colour(tile), tile.cov);
+	}
+
+	if (mode == 1) {
+		float4 a_col = a_tex.Sample(textureSampler, uv);
+		float4 b_col = b_tex.Sample(textureSampler, uv);
+		if (invert)
+			return lerp(b_col, a_col, tile.cov);
+		return lerp(a_col, b_col, tile.cov);
+	}
+
+	/* dissolves: the outgoing scene is cropped or squeezed into the tile */
+	float2 centre_uv = tile.centre_px / canvas;
+
+	float4 base;
+
+	if (b_tiles) {
+		float grow = 1.0 - tile.s;
+		float cov_b = tile_coverage(tile.metric, grow, tile.aa);
+
+		base = tile_colour(tile);
+
+		/* The incoming tile has the same problem at the other end of the
+		 * transition: one that has not started growing would read the
+		 * incoming scene magnified up to 10000x, and those are most of
+		 * the canvas in the opening frames. Skipped the same way as the
+		 * outgoing sample below, and for the same reasons. */
+		if (cov_b > 0.0) {
+			float2 uv_b = uv;
+			if (mode == 4)
+				uv_b = centre_uv + (uv - centre_uv) / max(grow, 0.0001);
+
+			base = lerp(base, b_tex.SampleLevel(textureSampler, uv_b, 0.0), cov_b);
+		}
+	} else {
+		base = b_tex.SampleLevel(textureSampler, uv, 0.0);
+	}
+
+	/*
+	 * A tile with no coverage shows none of the outgoing scene, so the
+	 * sample below is multiplied away. Returning early skips it.
+	 *
+	 * This is worth a branch because the sample is the expensive one. Scale
+	 * Shrink divides by the tile scale, so as a tile finishes shrinking the
+	 * divisor falls to the 0.0001 floor and the coordinate is magnified by
+	 * up to 10000x: neighbouring pixels then read texels thousands apart and
+	 * every fetch misses the texture cache. Spent tiles are exactly the ones
+	 * pinned at that floor, and they are most of the canvas by the end of the
+	 * sweep, so the worst case ran over the largest area in the closing
+	 * frames. Coverage is zero across a whole spent tile, so the branch is
+	 * coherent rather than pixel by pixel.
+	 *
+	 * SampleLevel, not Sample: the branch only holds if the fetch needs no
+	 * gradients, otherwise it gets flattened back into an unconditional
+	 * sample. Both scenes arrive as canvas sized render targets with no mip
+	 * chain, so level 0 is the level Sample was already resolving to.
+	 */
+	if (tile.cov <= 0.0)
+		return base;
+
+	float2 uv_a = uv;
+	if (mode == 4)
+		uv_a = centre_uv + (uv - centre_uv) / max(tile.s, 0.0001);
+
+	return lerp(base, a_tex.SampleLevel(textureSampler, uv_a, 0.0), tile.cov);
+}
+
+technique Tiles
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader = PSTiles(v_in);
+	}
+}

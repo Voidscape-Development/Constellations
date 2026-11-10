@@ -48,9 +48,88 @@ target_sources(
     src/pattern-border.c
     src/skylines-source.c
     src/nanosvg-impl.c
+    src/transition-common.c
+    src/presets.c
+    src/tiles-math.c
+    src/tiles-transition.c
+    src/vortex-math.c
+    src/vortex-transition.c
+    src/glass-mesh.c
+    src/glass-transition.c
+    src/matte-math.c
+    src/matte-transition.c
+    src/portal-math.c
+    src/portal-transition.c
 )
+
+if(NOT MSVC)
+  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE m)
+endif()
 
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/deps/nanosvg")
 set_source_files_properties(src/nanosvg-impl.c PROPERTIES COMPILE_OPTIONS "$<$<NOT:$<C_COMPILER_ID:MSVC>>:-w>")
+
+# Checks that render the transition effects on a real graphics device, so they
+# need libobs and are built with the plugin rather than in tests/. They carry
+# the "gpu" label; on a headless machine run them under xvfb-run:
+# `xvfb-run -a ctest -L gpu`. The unit tests that need no OBS SDK live in
+# tests/CMakeLists.txt.
+option(ENABLE_GPU_TESTS "Build the effect checks that render on a real graphics device" OFF)
+
+if(ENABLE_GPU_TESTS)
+  enable_testing()
+
+  function(add_gpu_check name)
+    add_executable(${name} ${ARGN})
+    target_link_libraries(${name} PRIVATE OBS::libobs)
+    target_include_directories(${name} PRIVATE src tests)
+    if(NOT MSVC)
+      target_link_libraries(${name} PRIVATE m)
+    endif()
+    if(APPLE)
+      target_compile_definitions(${name} PRIVATE GPU_CHECK_GRAPHICS_MODULE="libobs-opengl.dylib")
+    elseif(WIN32)
+      target_compile_definitions(${name} PRIVATE GPU_CHECK_GRAPHICS_MODULE="libobs-d3d11.dll")
+    endif()
+  endfunction()
+
+  # Sprite effects, each with uniforms and a schedule from its own math. The
+  # glass transition draws a mesh rather than a full screen sprite, so its
+  # check builds the shards with glass-mesh.c.
+  add_gpu_check(gpu-check tests/gpu-check.c src/tiles-math.c)
+  add_gpu_check(glass-check tests/glass-check.c src/glass-mesh.c)
+  foreach(check IN ITEMS matte portal vortex)
+    add_gpu_check(${check}-check tests/${check}-check.c src/${check}-math.c)
+  endforeach()
+
+  # Each check renders the effect of the same name, but for the tiling one,
+  # which was the first and is called gpu-check.
+  foreach(
+    effect
+    IN
+    ITEMS tiles glass matte portal vortex
+  )
+    if(effect STREQUAL "tiles")
+      set(exe gpu)
+    else()
+      set(exe ${effect})
+    endif()
+    add_test(
+      NAME ${exe}-check
+      COMMAND ${exe}-check "${CMAKE_CURRENT_SOURCE_DIR}/data/effects/${effect}_transition.effect"
+    )
+    set_tests_properties(${exe}-check PROPERTIES LABELS gpu)
+  endforeach()
+
+  # Loads the plugin module itself and drives each transition through libobs,
+  # so it runs the plugin's own code between the settings and the effects.
+  add_gpu_check(plugin-check tests/plugin-check.c)
+  add_dependencies(plugin-check ${CMAKE_PROJECT_NAME})
+  add_test(
+    NAME plugin-check
+    COMMAND plugin-check "$<TARGET_FILE:${CMAKE_PROJECT_NAME}>" "${CMAKE_CURRENT_SOURCE_DIR}/data"
+  )
+  set_tests_properties(plugin-check PROPERTIES LABELS gpu)
+endif()
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})

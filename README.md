@@ -1,6 +1,6 @@
 # Constellations
 
-Animated pattern backgrounds, borders and overlays for [OBS Studio](https://obsproject.com/) 33 and later.
+Animated pattern backgrounds, borders, overlays and scene transitions for [OBS Studio](https://obsproject.com/) 33 and later.
 
 ## What's included
 
@@ -10,11 +10,22 @@ Animated pattern backgrounds, borders and overlays for [OBS Studio](https://obsp
 | **Pattern Filter** | Filter | The same patterns drawn over any source. |
 | **Pattern Border** | Filter | A frame of shapes around a source, inside its edges or grown outside them, with rounded corners. |
 | **Skylines Background** | Source and filter | A flat-look city skyline with lit windows, drift and window twinkle. |
+| **Tiling Transition** | Transition | The screen is divided into a lattice of shapes that animate in sequence to carry you to the next scene. |
+| **Vortex Transition** | Transition | A spiral portal tears open over the outgoing scene, swallows the canvas, and lets the incoming one in through the smoke. |
+| **Glass Transition** | Transition | The outgoing scene cracks from a point of impact, holds a beat, and the shards fall away. |
+| **Matte Cutout Transition** | Transition | One big shape cuts the outgoing scene away, with optional border, echo bands and glow for a stinger look. |
+| **Portal Transition** | Transition | A portal is shot open with the incoming scene showing through it, then grows to swallow the canvas. |
 
 Pattern items can be built-in shapes (circle, cross, square, polygon, squircle, lines, star, heart), images (PNG, JPG,
 SVG and more, plus built-in SVG presets) or any other OBS source. Up to 32 items can be layered, alternated in a step
 and repeat, or scattered across a grid. Each item can have its own size, rotation, offset, density and colors (including
 random per-cell colors). Patterns can scroll, wander, twinkle and rotate, and a vignette can fade them out.
+
+The transitions are generated on the GPU with no bundled video; add them in OBS under **Scene Transitions → +**. See
+[docs/transitions.md](docs/transitions.md) for every transition's settings.
+
+The transitions used to ship as a separate plugin, Tiles. They keep the same IDs, so scene collections that use them
+carry over: install Constellations, then remove the old `tiles` plugin so the transitions aren't registered twice.
 
 ## Installing
 
@@ -47,13 +58,25 @@ See the plugin template wiki for the
 
 ### Tests
 
-The placement math (`src/lattice.c`) has unit tests that need no OBS SDK:
+The placement math (`src/lattice.c`) and the transition math (`src/*-math.c`, `src/glass-mesh.c` and the shaders'
+`data/effects/*_math.effect`) have unit tests that need no OBS SDK:
 
 ```sh
-cmake -S tests -B build_tests
+cmake -S tests -B build_tests -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build_tests
 ctest --test-dir build_tests --output-on-failure
 ```
+
+The transition effects also have checks that render on a real graphics device, built with the plugin. On a headless
+machine run them under Xvfb:
+
+```sh
+cmake --preset ubuntu-x86_64 -DENABLE_GPU_TESTS=ON
+cmake --build --preset ubuntu-x86_64
+xvfb-run -a ctest --test-dir build_x86_64 --output-on-failure -L gpu
+```
+
+[docs/transitions.md](docs/transitions.md#how-the-transitions-are-tested) describes what each test covers.
 
 ### Formatting
 

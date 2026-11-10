@@ -300,4 +300,3 @@ double clat_border_row_phase(double march, float row, float cell, float offset_a
 		ph += 0.5;
 	return clat_fmod_pos(ph, (double)total);
 }
-
