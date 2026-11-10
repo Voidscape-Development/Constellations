@@ -40,8 +40,6 @@ bool obs_module_load(void)
 	obs_log(LOG_INFO, "Constellations loading (version %s)", PLUGIN_VERSION);
 	cpat_media_init();
 	constellations_register_pattern_source();
-	constellations_register_topography_source();
-	constellations_register_topography_filter();
 	constellations_register_skylines();
 	constellations_register_pattern_filter();
 	constellations_register_pattern_border();

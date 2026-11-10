@@ -301,22 +301,3 @@ double clat_border_row_phase(double march, float row, float cell, float offset_a
 	return clat_fmod_pos(ph, (double)total);
 }
 
-void clat_topo_octave_offsets(double dx, double dy, double period, float out[CLAT_TOPO_OCTAVES][4])
-{
-	double ox = dx, oy = dy;
-	for (int k = 0; k < CLAT_TOPO_OCTAVES; ++k) {
-		double fx = floor(ox), fy = floor(oy);
-		out[k][0] = (float)clat_fmod_pos(fx, period);
-		out[k][1] = (float)clat_fmod_pos(fy, period);
-		out[k][2] = (float)(ox - fx);
-		out[k][3] = (float)(oy - fy);
-		double nx = ox * 1.6 - oy * 1.2 + 31.4;
-		double ny = ox * 1.2 + oy * 1.6 + 31.4;
-		/* M has entries in fifths, so M^j maps multiples of 5^4 periods
-		 * to whole periods for every remaining octave: wrapping by that
-		 * keeps the values bounded without changing any lattice index
-		 * modulo the period. */
-		ox = clat_fmod_pos(nx, period * 625.0);
-		oy = clat_fmod_pos(ny, period * 625.0);
-	}
-}

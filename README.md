@@ -9,7 +9,6 @@ Animated pattern backgrounds, borders and overlays for [OBS Studio](https://obsp
 | **Pattern Background** | Source | A canvas of tiled shapes, images or other sources on a solid or gradient background. |
 | **Pattern Filter** | Filter | The same patterns drawn over any source. |
 | **Pattern Border** | Filter | A frame of shapes around a source, inside its edges or grown outside them, with rounded corners. |
-| **Topography Lines** | Source and filter | Procedural contour-map lines with optional glow, grid and drift. |
 | **Skylines Background** | Source and filter | A flat-look city skyline with lit windows, drift and window twinkle. |
 
 Pattern items can be built-in shapes (circle, cross, square, polygon, squircle, lines, star, heart), images (PNG, JPG,
