@@ -10,6 +10,7 @@ Animated pattern backgrounds, borders, overlays and scene transitions for [OBS S
 | **Pattern Filter** | Filter | The same patterns drawn over any source. |
 | **Pattern Border** | Filter | A frame of shapes around a source, inside its edges or grown outside them, with rounded corners. |
 | **Skylines Background** | Source and filter | A flat-look city skyline with lit windows, drift and window twinkle. |
+| **Text Tiles Background** | Source and filter | A phrase repeated in rows across the canvas, each row sliding at its own speed and direction. |
 | **Tiling Transition** | Transition | The screen is divided into a lattice of shapes that animate in sequence to carry you to the next scene. |
 | **Vortex Transition** | Transition | A spiral portal tears open over the outgoing scene, swallows the canvas, and lets the incoming one in through the smoke. |
 | **Glass Transition** | Transition | The outgoing scene cracks from a point of impact, holds a beat, and the shards fall away. |
@@ -20,6 +21,14 @@ Pattern items can be built-in shapes (circle, cross, square, polygon, squircle, 
 SVG and more, plus built-in SVG presets) or any other OBS source. Up to 32 items can be layered, alternated in a step
 and repeat, or scattered across a grid. Each item can have its own size, rotation, offset, density and colors (including
 random per-cell colors). Patterns can scroll, wander, twinkle and rotate, and a vignette can fade them out.
+
+Text Tiles repeats one phrase (with an optional separator such as • or ★) along rows, in any installed font picked
+through the standard OBS font dialog. Rows can all move the same way, alternate, or pick a random direction each, with
+per-row speed variation and an optional slow speed wander so rows drift past each other. A row stagger gives the
+stair-step look, and the whole pattern can be rotated. The text can be a solid color, a gradient across the canvas or
+along each word, or tone-on-tone (darkening or lightening whatever is behind it), filled or as outlines only. As a
+source it draws over a solid, linear or radial gradient background, or a transparent one; as a filter it draws over
+the filtered source.
 
 The transitions are generated on the GPU with no bundled video; add them in OBS under **Scene Transitions → +**. See
 [docs/transitions.md](docs/transitions.md) for every transition's settings.
@@ -58,8 +67,8 @@ See the plugin template wiki for the
 
 ### Tests
 
-The placement math (`src/lattice.c`) and the transition math (`src/*-math.c`, `src/glass-mesh.c` and the shaders'
-`data/effects/*_math.effect`) have unit tests that need no OBS SDK:
+The placement math (`src/lattice.c`), the Text Tiles row motion (`src/text-tiles-math.c`) and the transition math
+(`src/*-math.c`, `src/glass-mesh.c` and the shaders' `data/effects/*_math.effect`) have unit tests that need no OBS SDK:
 
 ```sh
 cmake -S tests -B build_tests -DCMAKE_BUILD_TYPE=RelWithDebInfo

@@ -47,6 +47,8 @@ target_sources(
     src/pattern-filter.c
     src/pattern-border.c
     src/skylines-source.c
+    src/text-tiles-math.c
+    src/text-tiles-source.c
     src/nanosvg-impl.c
     src/transition-common.c
     src/presets.c

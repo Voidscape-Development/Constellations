@@ -48,6 +48,7 @@ bool obs_module_load(void)
 	constellations_register_skylines();
 	constellations_register_pattern_filter();
 	constellations_register_pattern_border();
+	constellations_register_text_tiles();
 	obs_register_source(&tiles_transition);
 	obs_register_source(&vortex_transition);
 	obs_register_source(&glass_transition);
