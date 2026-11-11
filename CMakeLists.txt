@@ -22,15 +22,19 @@ if(ENABLE_FRONTEND_API)
 endif()
 
 if(ENABLE_QT)
-  find_package(Qt6 COMPONENTS Widgets Core)
-  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE Qt6::Core Qt6::Widgets)
+  find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets)
+  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets)
   target_compile_options(
     ${CMAKE_PROJECT_NAME}
     PRIVATE $<$<C_COMPILER_ID:Clang,AppleClang>:-Wno-quoted-include-in-framework-header -Wno-comma>
   )
+  # Nothing here derives from QObject or uses .ui or .qrc files, so no moc,
+  # uic or rcc step. Leaving them off also avoids the autogen script phase,
+  # whose moc preprocessing fails under Xcode 26 ("conflicting deployment
+  # targets").
   set_target_properties(
     ${CMAKE_PROJECT_NAME}
-    PROPERTIES AUTOMOC ON AUTOUIC ON AUTORCC ON
+    PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF
   )
 endif()
 
@@ -47,6 +51,7 @@ target_sources(
     src/pattern-filter.c
     src/pattern-border.c
     src/skylines-source.c
+    src/text-tiles-math.c
     src/nanosvg-impl.c
     src/transition-common.c
     src/presets.c
@@ -61,6 +66,13 @@ target_sources(
     src/portal-math.c
     src/portal-transition.c
 )
+
+# Text Tiles lays its text out with Qt, so it is only built with Qt enabled
+# (the presets enable it).
+if(ENABLE_QT)
+  target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/text-tiles-source.c src/text-tiles-raster.cpp)
+  target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE CONSTELLATIONS_HAS_QT)
+endif()
 
 if(NOT MSVC)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE m)

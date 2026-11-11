@@ -1,0 +1,258 @@
+// Constellations - Text Tiles Background / Filter
+//
+// One full-canvas pass draws every row of repeating text. The phrase and the
+// separator come in as signed distance fields (text-tiles-raster.cpp): each
+// texel holds the distance to the nearest letter edge, so coverage and
+// outlines of any width are one sample each and stay sharp under rotation.
+// Each row's sideways position is computed on the CPU (text-tiles-math.c) in
+// double precision, wrapped into one period, and handed over in row_offsets,
+// one texel per row.
+//
+// Rows run along x after rotating the canvas about its centre. Row r is
+// centred on rotated y = r * row_pitch and is text_size.y tall; each repeats
+// one period: phrase, gap, separator, gap.
+
+uniform float4x4 ViewProj;
+
+uniform float2 canvas_size;
+uniform float2 rot_cs;         // cos, sin of the pattern rotation
+
+uniform float row_pitch;       // px between row centres
+uniform float row_first;       // row held in texel 0 of row_offsets
+uniform float row_count;       // rows held
+uniform float row_tex_w;       // width of row_offsets in texels
+
+uniform float2 text_size;      // phrase layout box, px
+uniform float4 text_rect;      // the phrase field's x, y, width, height in that box, px
+uniform float2 sep_size;       // separator layout box, px
+uniform float4 sep_rect;
+uniform float2 sep_pos;        // separator box's top left within the period, px
+uniform float period;          // px from one phrase to the next
+uniform float has_sep;
+uniform float sdf_spread;      // px the fields reach either side of an edge
+
+uniform float outline_px;      // 0 = filled letters
+uniform float fill_mode;       // 0 solid, 1 tone-on-tone, 2 gradient
+uniform float4 text_color;     // sRGB-encoded, straight alpha (opacity applied)
+uniform float4 text_color2;
+uniform float grad_span;       // 0 across the canvas, 1 within each word
+uniform float2 grad_dir;
+uniform float tone_amount;     // 0..1, the blend picks darken or lighten
+
+// Background (sRGB-encoded, straight alpha)
+uniform float4 bg_color;
+uniform float4 bg_color2;
+uniform float bg_type;         // 0 solid, 1 radial, 2 linear
+uniform float2 bg_dir;
+
+uniform texture2d text_sdf;    // R16: 0.5 - distance / (2 * spread)
+uniform texture2d sep_sdf;
+uniform texture2d row_offsets; // R32F, px each row has moved right, wrapped
+
+sampler_state MaskSampler {
+	Filter   = Linear;
+	AddressU = Clamp;
+	AddressV = Clamp;
+};
+
+sampler_state RowSampler {
+	Filter   = Point;
+	AddressU = Clamp;
+	AddressV = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData v_out;
+	v_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	v_out.uv  = v_in.uv;
+	return v_out;
+}
+
+// ---------------------------------------------------------------- helpers
+
+float wrapf(float x, float m)
+{
+	float r = x - floor(x / m) * m;
+	if (r < 0.0)
+		r += m;
+	if (r >= m)
+		r -= m;
+	return r;
+}
+
+// Dave Hoskins' sine-free hash12.
+float hash11(float2 p, float seed)
+{
+	p += seed * float2(0.7548777, 0.5698403);
+	float3 p3 = frac(float3(p.x, p.y, p.x) * 0.1031);
+	p3 += dot(p3, float3(p3.y, p3.z, p3.x) + 33.33);
+	return frac((p3.x + p3.y) * p3.z);
+}
+
+float srgb_to_linear(float c)
+{
+	return (c <= 0.04045) ? (c / 12.92) : pow((c + 0.055) / 1.055, 2.4);
+}
+
+float3 to_linear(float3 c)
+{
+	return float3(srgb_to_linear(saturate(c.r)), srgb_to_linear(saturate(c.g)), srgb_to_linear(saturate(c.b)));
+}
+
+// t of a linear gradient spanning the canvas exactly along dir.
+float canvas_t(float2 px, float2 dir)
+{
+	float2 half_canvas = canvas_size * 0.5;
+	float extent = abs(dir.x) * half_canvas.x + abs(dir.y) * half_canvas.y;
+	return dot(px - half_canvas, dir) / max(2.0 * extent, 1.0) + 0.5;
+}
+
+// ---------------------------------------------------------------- text
+
+// Distance in px from p (in a layout box) to the nearest edge of the phrase
+// or separator, negative inside; at least the spread outside the field.
+// One function per texture: OBS's GLSL translation only handles samples of
+// a texture uniform named directly, not one passed as a parameter.
+float field_uv_ok(float2 uv)
+{
+	return (uv.x >= 0.0 && uv.y >= 0.0 && uv.x <= 1.0 && uv.y <= 1.0) ? 1.0 : 0.0;
+}
+
+float text_sd(float2 p)
+{
+	float2 uv = (p - text_rect.xy) / text_rect.zw;
+	if (field_uv_ok(uv) < 0.5)
+		return sdf_spread;
+	return (0.5 - text_sdf.SampleLevel(MaskSampler, uv, 0).r) * 2.0 * sdf_spread;
+}
+
+float sep_sd(float2 p)
+{
+	float2 uv = (p - sep_rect.xy) / sep_rect.zw;
+	if (field_uv_ok(uv) < 0.5)
+		return sdf_spread;
+	return (0.5 - sep_sdf.SampleLevel(MaskSampler, uv, 0).r) * 2.0 * sdf_spread;
+}
+
+// Distance from p, in row-local px (x along the row, y down from the row's
+// top), to the repeating phrase/separator strip. The neighbouring repeats
+// are checked too, so ink or an outline that reaches across the gap is not
+// cut off where the period wraps.
+float strip_sd(float2 p)
+{
+	float x = wrapf(p.x, period);
+	float d = text_sd(float2(x, p.y));
+	d = min(d, text_sd(float2(x - period, p.y)));
+	d = min(d, text_sd(float2(x + period, p.y)));
+	if (has_sep > 0.5)
+		d = min(d, sep_sd(float2(x, p.y) - sep_pos));
+	return d;
+}
+
+// Where along its own word p falls, 0..1, for gradients that span each word.
+// Gap pixels (outline strokes) take the nearer word's end.
+float word_t(float2 p)
+{
+	float x = wrapf(p.x, period);
+	if (has_sep > 0.5) {
+		float sep_end = sep_pos.x + sep_size.x;
+		if (x < 0.5 * (text_size.x + sep_pos.x))
+			return saturate(x / text_size.x);
+		if (x < 0.5 * (sep_end + period))
+			return saturate((x - sep_pos.x) / max(sep_size.x, 1.0));
+		return 0.0;
+	}
+	if (x < 0.5 * (text_size.x + period))
+		return saturate(x / text_size.x);
+	return 0.0;
+}
+
+// x = distance from rotated point q to row r's letters, y = word gradient t.
+float2 row_sample(float2 q, float r)
+{
+	float i = r - row_first;
+	if (i < 0.0 || i >= row_count)
+		return float2(sdf_spread, 0.0);
+	float off = row_offsets.SampleLevel(RowSampler, float2((i + 0.5) / row_tex_w, 0.5), 0).r;
+	float2 p = float2(q.x - off, q.y - (r * row_pitch - 0.5 * text_size.y));
+	return float2(strip_sd(p), word_t(p));
+}
+
+float4 PSText(VertData v_in) : TARGET
+{
+	float2 px = v_in.uv * canvas_size;
+	float2 c = px - canvas_size * 0.5;
+	// Rotate the canvas back so rows run along x.
+	float2 q = float2(rot_cs.x * c.x + rot_cs.y * c.y, -rot_cs.y * c.x + rot_cs.x * c.y);
+
+	// Rows are at least half as far apart as they are tall, so at most two
+	// overlap any point; the row below is checked as well for ink and
+	// outlines that reach past the layout box.
+	float r_hi = floor((q.y + 0.5 * text_size.y) / row_pitch);
+	float2 a = row_sample(q, r_hi);
+	float2 b = row_sample(q, r_hi - 1.0);
+	float2 c2 = row_sample(q, r_hi + 1.0);
+	float2 s = (b.x < a.x) ? b : a;
+	s = (c2.x < s.x) ? c2 : s;
+	// The canvas is drawn 1:1, so one px of distance is one px of edge.
+	float d = (outline_px > 0.0) ? abs(s.x) - 0.5 * outline_px : s.x;
+	float cov = saturate(0.5 - d);
+
+	if (fill_mode > 0.5 && fill_mode < 1.5)
+		return float4(tone_amount * cov, tone_amount * cov, tone_amount * cov, 0.0);
+
+	float4 col = text_color;
+	if (fill_mode > 1.5) {
+		float t = (grad_span > 0.5) ? s.y : canvas_t(px, grad_dir);
+		col = lerp(text_color, text_color2, saturate(t));
+	}
+	float alpha = col.a * cov;
+	return float4(to_linear(col.rgb) * alpha, alpha);
+}
+
+// ---------------------------------------------------------------- background
+
+float4 PSBackground(VertData v_in) : TARGET
+{
+	float2 px = v_in.uv * canvas_size;
+	float4 c = bg_color;
+	if (bg_type > 0.5) {
+		float t;
+		if (bg_type < 1.5) {
+			// Radial: center of the canvas out to its corners.
+			float2 half_canvas = canvas_size * 0.5;
+			t = length(px - half_canvas) / max(length(half_canvas), 1.0);
+		} else {
+			t = canvas_t(px, bg_dir);
+		}
+		c = lerp(bg_color, bg_color2, saturate(t));
+		// One code of noise hides banding in 8-bit output.
+		c.rgb += (hash11(floor(px), 0.0) - 0.5) / 255.0;
+	}
+	float a = c.a;
+	return float4(to_linear(c.rgb) * a, a);
+}
+
+technique Background
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSBackground(v_in);
+	}
+}
+
+technique Text
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSText(v_in);
+	}
+}

@@ -17,6 +17,12 @@ target_compile_options(test-lattice PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-Wall
 target_link_libraries(test-lattice PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:m>)
 add_test(NAME lattice COMMAND test-lattice)
 
+add_executable(test-text-tiles test-text-tiles.c ../src/text-tiles-math.c)
+target_include_directories(test-text-tiles PRIVATE ../src)
+target_compile_options(test-text-tiles PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-Wall -Wextra -Werror>)
+target_link_libraries(test-text-tiles PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:m>)
+add_test(NAME text-tiles COMMAND test-text-tiles)
+
 # Transition math. The *-math.c files hold the CPU side of each transition;
 # the shader tests compile the effect's *_math.effect as C++ through hlsl.hpp,
 # so they check the code the shader runs rather than a copy of it. HLSL
