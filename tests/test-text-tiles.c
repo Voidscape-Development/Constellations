@@ -12,6 +12,7 @@ the Free Software Foundation; either version 2 of the License, or
 
 #include <math.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 
 static int failures;
@@ -154,6 +155,92 @@ static void test_range(void)
 	CHECK(first == -CTT_ROW_HALF && count == CTT_ROW_SLOTS, "range is clamped: %d %d", first, count);
 }
 
+/* Coverage of a disc, 16x16 supersampled per texel. */
+static void disc_coverage(uint8_t *cov, int w, int h, double cx, double cy, double r)
+{
+	for (int y = 0; y < h; ++y) {
+		for (int x = 0; x < w; ++x) {
+			int in = 0;
+			for (int sy = 0; sy < 16; ++sy)
+				for (int sx = 0; sx < 16; ++sx) {
+					double px = x + (sx + 0.5) / 16.0, py = y + (sy + 0.5) / 16.0;
+					in += hypot(px - cx, py - cy) <= r;
+				}
+			cov[y * w + x] = (uint8_t)lrint(in * 255.0 / 256.0);
+		}
+	}
+}
+
+static void test_sdf_disc(void)
+{
+	enum { W = 96, H = 80 };
+	static uint8_t cov[W * H];
+	static uint16_t sdf[W * H];
+	const double cx = 47.3, cy = 39.8, r = 24.6;
+	const float texel_px = 0.5f, spread = 8.0f;
+	disc_coverage(cov, W, H, cx, cy, r);
+	CHECK(ctt_sdf_build(cov, W, H, texel_px, spread, sdf), "build");
+	double worst = 0.0;
+	int inside = 0, outside = 0, clamped = 0;
+	for (int y = 0; y < H; ++y) {
+		for (int x = 0; x < W; ++x) {
+			double truth = (hypot(x + 0.5 - cx, y + 0.5 - cy) - r) * texel_px;
+			float d = ctt_sdf_decode(sdf[y * W + x], spread);
+			if (fabs(truth) < spread - 0.5) {
+				worst = fmax(worst, fabs(d - truth));
+				inside += truth < -1.0;
+				outside += truth > 1.0;
+			} else {
+				clamped++;
+				double want = fmax(-spread, fmin(spread, truth));
+				CHECK(fabs(d - want) < 0.25, "texel near the spread: %f vs %f", d, want);
+			}
+			if (truth < -1.0)
+				CHECK(d < 0.0f, "inside is negative at %d,%d: %f", x, y, d);
+			if (truth > 1.0)
+				CHECK(d > 0.0f, "outside is positive at %d,%d: %f", x, y, d);
+		}
+	}
+	/* A quarter of a canvas px: well under the one px the edge is
+	 * anti-aliased over. */
+	CHECK(worst < 0.25, "disc distance error %f px", worst);
+	CHECK(inside > 100 && outside > 100 && clamped > 100, "samples %d %d %d", inside, outside, clamped);
+}
+
+static void test_sdf_edge(void)
+{
+	/* A vertical edge 20.25 texels in: distances along x are exact. */
+	enum { W = 48, H = 8 };
+	uint8_t cov[W * H];
+	uint16_t sdf[W * H];
+	for (int y = 0; y < H; ++y)
+		for (int x = 0; x < W; ++x)
+			cov[y * W + x] = x < 20 ? 255 : (x == 20 ? 64 : 0);
+	CHECK(ctt_sdf_build(cov, W, H, 1.0f, 16.0f, sdf), "build");
+	for (int x = 0; x < W; ++x) {
+		double truth = x + 0.5 - (20.0 + 64.0 / 255.0);
+		if (fabs(truth) > 15.0)
+			continue;
+		float d = ctt_sdf_decode(sdf[3 * W + x], 16.0f);
+		CHECK(fabs(d - truth) < 0.3, "edge x=%d: %f vs %f", x, d, truth);
+	}
+}
+
+static void test_sdf_extremes(void)
+{
+	uint8_t empty[64] = {0}, full[64];
+	uint16_t sdf[64];
+	for (int i = 0; i < 64; ++i)
+		full[i] = 255;
+	CHECK(ctt_sdf_build(empty, 8, 8, 1.0f, 4.0f, sdf), "build empty");
+	for (int i = 0; i < 64; ++i)
+		CHECK(ctt_sdf_decode(sdf[i], 4.0f) > 3.99f, "empty is all outside");
+	CHECK(ctt_sdf_build(full, 8, 8, 1.0f, 4.0f, sdf), "build full");
+	for (int i = 0; i < 64; ++i)
+		CHECK(ctt_sdf_decode(sdf[i], 4.0f) < -3.99f, "full is all inside");
+	CHECK(ctt_sdf_build(empty, 0, 0, 1.0f, 4.0f, sdf), "zero size is fine");
+}
+
 int main(void)
 {
 	test_wrap();
@@ -163,6 +250,9 @@ int main(void)
 	test_wander();
 	test_start();
 	test_range();
+	test_sdf_disc();
+	test_sdf_edge();
+	test_sdf_extremes();
 	if (failures) {
 		fprintf(stderr, "%d check(s) failed\n", failures);
 		return 1;

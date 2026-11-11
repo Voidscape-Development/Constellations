@@ -10,24 +10,28 @@ the Free Software Foundation; either version 2 of the License, or
 
 #include <obs-module.h>
 #include <plugin-support.h>
+#include <util/dstr.h>
 #include <util/platform.h>
+#include <util/task.h>
 #include <util/threading.h>
 #include <math.h>
 #include <string.h>
-#include <wctype.h>
 
 #include "shape-defs.h"
 #include "common.h"
 #include "text-tiles-math.h"
+#include "text-tiles-raster.h"
 
 /* A phrase repeated along rows that each slide sideways at their own speed.
  *
- * The letters are drawn by a private OBS text source (GDI+ on Windows,
- * FreeType elsewhere), so any installed font works through the standard font
- * picker. Every frame that source is rendered into an alpha mask, and one
- * full-canvas pass of text_tiles.effect repeats the mask along every row.
- * The rows' positions are integrated here in double precision and handed to
- * the shader one texel per row. */
+ * The phrase and the separator are laid out and rasterized with Qt (any
+ * installed font, through the standard OBS font picker) into signed distance
+ * fields, on a loader thread whenever the text or font changes. One
+ * full-canvas pass of text_tiles.effect repeats them along every row; filled
+ * letters, outlines of any width and the anti-aliased edge all come from the
+ * distance, so the text stays crisp at any rotation. The rows' positions are
+ * integrated here in double precision and handed to the shader one texel per
+ * row. */
 
 enum ctt_fill_mode {
 	CTT_FILL_SOLID = 0,
@@ -40,6 +44,11 @@ enum ctt_gradient_span {
 	CTT_SPAN_WORD = 1,
 };
 
+/* How far, in canvas px, the distance fields reach either side of an edge.
+ * Half the widest outline plus a pixel for its anti-aliasing must fit. */
+#define CTT_SDF_SPREAD 12.0f
+#define CTT_MAX_OUTLINE 20.0
+
 enum {
 	P_CANVAS_SIZE,
 	P_ROT_CS,
@@ -48,10 +57,13 @@ enum {
 	P_ROW_COUNT,
 	P_ROW_TEX_W,
 	P_TEXT_SIZE,
+	P_TEXT_RECT,
 	P_SEP_SIZE,
+	P_SEP_RECT,
 	P_SEP_POS,
 	P_PERIOD,
 	P_HAS_SEP,
+	P_SDF_SPREAD,
 	P_OUTLINE_PX,
 	P_FILL_MODE,
 	P_TEXT_COLOR,
@@ -63,26 +75,19 @@ enum {
 	P_BG_COLOR2,
 	P_BG_TYPE,
 	P_BG_DIR,
-	P_TEXT_MASK,
-	P_SEP_MASK,
+	P_TEXT_SDF,
+	P_SEP_SDF,
 	P_ROW_OFFSETS,
 	P_COUNT,
 };
 
 static const char *const param_names[] = {
-	"canvas_size", "rot_cs",    "row_pitch", "row_first",   "row_count",  "row_tex_w", "text_size",
-	"sep_size",    "sep_pos",   "period",    "has_sep",     "outline_px", "fill_mode", "text_color",
-	"text_color2", "grad_span", "grad_dir",  "tone_amount", "bg_color",   "bg_color2", "bg_type",
-	"bg_dir",      "text_mask", "sep_mask",  "row_offsets",
+	"canvas_size", "rot_cs",    "row_pitch",  "row_first",   "row_count", "row_tex_w", "text_size",
+	"text_rect",   "sep_size",  "sep_rect",   "sep_pos",     "period",    "has_sep",   "sdf_spread",
+	"outline_px",  "fill_mode", "text_color", "text_color2", "grad_span", "grad_dir",  "tone_amount",
+	"bg_color",    "bg_color2", "bg_type",    "bg_dir",      "text_sdf",  "sep_sdf",   "row_offsets",
 };
 _Static_assert(OBS_COUNTOF(param_names) == P_COUNT, "param_names must list every P_ uniform");
-
-/* Text sources to draw the letters with, best first. */
-static const char *const text_source_ids[] = {
-	"text_gdiplus_v3",
-	"text_gdiplus_v2",
-	"text_ft2_source_v2",
-};
 
 #if defined(_WIN32)
 #define CTT_DEFAULT_FACE "Arial"
@@ -95,7 +100,6 @@ static const char *const text_source_ids[] = {
 struct ctt_config {
 	uint32_t width, height;
 
-	bool has_sep;
 	float word_gap;     /* px between a phrase and the separator (or next phrase) */
 	float line_spacing; /* px added between rows; negative pulls them together */
 
@@ -117,11 +121,32 @@ struct ctt_config {
 	bool has_bg;
 };
 
-/* This frame's text layout, worked out before drawing. */
+/* What the text is rasterized from. */
+struct ctt_text_request {
+	char *face, *style;
+	int size;
+	uint32_t flags;
+	float letter_spacing;
+	bool upper;
+	char *text, *sep; /* sep NULL when there is none */
+};
+
+/* The phrase and separator fields the loader produced. */
+struct ctt_raster {
+	struct ctt_glyphs text, sep;
+};
+
+/* One uploaded field and where it lies in its layout box. */
+struct ctt_field {
+	gs_texture_t *tex;
+	float box_w, box_h;
+	struct vec4 rect; /* x, y, width, height of the texture, canvas px */
+};
+
+/* This frame's row layout, worked out before drawing. */
 struct ctt_frame {
-	gs_texture_t *text_tex, *sep_tex;
 	float pitch, first, count;
-	float text_w, text_h, sep_w, sep_h, sep_x, period;
+	float sep_x, period;
 	bool has_sep;
 };
 
@@ -130,29 +155,31 @@ struct ctt_source {
 	bool is_filter;
 	struct cfx_effect fx;
 
-	/* Created once; their settings change from update() on the UI thread,
-	 * and OBS applies that on their next tick. */
-	obs_source_t *text_src;
-	obs_source_t *sep_src;
-	bool text_is_ft2;
-	char *text_applied, *sep_applied; /* UI thread */
-
 	pthread_mutex_t mutex;
 	struct ctt_config pending;
 	bool has_pending;
 	volatile long width, height;
 	volatile long reset_motion;
 
+	/* Text rasterization. update() queues a request when the text or font
+	 * changed (raster_key remembers the last one; only update() reads it);
+	 * the loader thread builds the fields and leaves them in raster_ready,
+	 * and the next frame uploads them. A request overtaken by a newer one
+	 * is dropped. */
+	os_task_queue_t *loader;
+	volatile long raster_generation;
+	char *raster_key;
+	struct ctt_raster *raster_ready; /* under mutex */
+
 	/* Graphics thread. */
 	struct ctt_config cfg;
 	double clock;
 	double last_period;
 	struct ctt_frame frame;
+	struct ctt_field text_field, sep_field;
 	double *row_pos; /* px each row has moved right, index row + CTT_ROW_HALF */
 	float *row_buf;
 	gs_texture_t *row_tex;
-	gs_texrender_t *text_tr;
-	gs_texrender_t *sep_tr;
 	/* Tone-on-tone blends with what is beneath the text, so it is drawn
 	 * with its base into this first; otherwise it would tint whatever the
 	 * scene has behind a transparent background. */
@@ -172,35 +199,7 @@ static const char *ctt_filter_get_name(void *unused)
 	return obs_module_text("Constellations.TextTilesFilter.Name");
 }
 
-/* ------------------------------------------------------------ text sources */
-
-static const char *find_text_source_id(void)
-{
-	for (size_t i = 0; i < OBS_COUNTOF(text_source_ids); ++i)
-		if (obs_source_get_display_name(text_source_ids[i]))
-			return text_source_ids[i];
-	return NULL;
-}
-
-/* UTF-8 uppercase, or a copy when `upper` is false. bfree() the result. */
-static char *text_transform(const char *in, bool upper)
-{
-	if (!in)
-		in = "";
-	if (!upper)
-		return bstrdup(in);
-	/* Allocates even for an empty string, returning length 0. */
-	wchar_t *w = NULL;
-	os_utf8_to_wcs_ptr(in, 0, &w);
-	if (!w)
-		return bstrdup(in);
-	for (wchar_t *c = w; *c; ++c)
-		*c = (wchar_t)towupper((wint_t)*c);
-	char *out = NULL;
-	os_wcs_to_utf8_ptr(w, 0, &out);
-	bfree(w);
-	return out ? out : bstrdup(in);
-}
+/* ------------------------------------------------------------ rasterizing */
 
 static bool is_blank(const char *s)
 {
@@ -210,40 +209,103 @@ static bool is_blank(const char *s)
 	return true;
 }
 
-/* White, unadorned, single-line text: only its coverage is used. `last`
- * remembers what was applied, so changing an unrelated setting (dragging the
- * speed slider, say) does not make OBS lay the text out again. */
-static void text_source_set(struct ctt_source *s, obs_source_t *src, char **last, obs_data_t *font, const char *text)
+static void raster_free(struct ctt_raster *r)
 {
-	if (!src)
+	if (!r)
 		return;
-	obs_data_t *d = obs_data_create();
-	obs_data_set_obj(d, "font", font);
-	obs_data_set_string(d, "text", text);
-	obs_data_set_bool(d, "antialiasing", true);
-	obs_data_set_bool(d, "outline", false);
-	if (s->text_is_ft2) {
-		obs_data_set_int(d, "color1", 0xFFFFFFFF);
-		obs_data_set_int(d, "color2", 0xFFFFFFFF);
-		obs_data_set_bool(d, "drop_shadow", false);
-		obs_data_set_bool(d, "word_wrap", false);
-		obs_data_set_bool(d, "from_file", false);
-	} else {
-		obs_data_set_int(d, "color", 0xFFFFFF);
-		obs_data_set_int(d, "opacity", 100);
-		obs_data_set_bool(d, "gradient", false);
-		obs_data_set_int(d, "bk_opacity", 0);
-		obs_data_set_bool(d, "extents", false);
-		obs_data_set_bool(d, "read_from_file", false);
-		obs_data_set_bool(d, "vertical", false);
+	ctt_glyphs_free(&r->text);
+	ctt_glyphs_free(&r->sep);
+	bfree(r);
+}
+
+static void request_free(struct ctt_text_request *q)
+{
+	bfree(q->face);
+	bfree(q->style);
+	bfree(q->text);
+	bfree(q->sep);
+	bfree(q);
+}
+
+static struct ctt_raster *raster_build(const struct ctt_text_request *q)
+{
+	struct ctt_raster *r = bzalloc(sizeof(*r));
+	struct ctt_font font = {
+		.face = q->face,
+		.style = q->style,
+		.size = q->size,
+		.flags = q->flags,
+		.letter_spacing = q->letter_spacing,
+	};
+	if (!ctt_raster_text(&font, q->text, q->upper, CTT_SDF_SPREAD, &r->text) && !is_blank(q->text))
+		obs_log(LOG_WARNING, "Text Tiles: could not lay out the text in font '%s'", q->face);
+	if (q->sep)
+		ctt_raster_text(&font, q->sep, q->upper, CTT_SDF_SPREAD, &r->sep);
+	return r;
+}
+
+/* Hands a finished raster to the next frame, unless a newer request has
+ * overtaken it. Takes ownership. */
+static void raster_publish(struct ctt_source *s, struct ctt_raster *r, long generation)
+{
+	struct ctt_raster *stale = r;
+	pthread_mutex_lock(&s->mutex);
+	if (os_atomic_load_long(&s->raster_generation) == generation) {
+		stale = s->raster_ready;
+		s->raster_ready = r;
 	}
-	const char *json = obs_data_get_json(d);
-	if (!*last || strcmp(*last, json) != 0) {
-		bfree(*last);
-		*last = bstrdup(json);
-		obs_source_update(src, d);
+	pthread_mutex_unlock(&s->mutex);
+	raster_free(stale);
+}
+
+struct ctt_raster_job {
+	struct ctt_source *s;
+	struct ctt_text_request *req;
+	long generation;
+};
+
+static void raster_task(void *param)
+{
+	struct ctt_raster_job *job = param;
+	struct ctt_source *s = job->s;
+	/* Superseded before it started, so not worth building. */
+	if (os_atomic_load_long(&s->raster_generation) == job->generation)
+		raster_publish(s, raster_build(job->req), job->generation);
+	request_free(job->req);
+	bfree(job);
+}
+
+/* Starts rasterizing `q` (taking ownership) unless it is what was last
+ * requested. Before the loader exists, inside create, it is built there and
+ * then, so the source never first appears without its text. */
+static void raster_request(struct ctt_source *s, struct ctt_text_request *q)
+{
+	struct dstr key = {0};
+	dstr_printf(&key, "%s\n%s\n%d\n%u\n%g\n%d\n%s\n%s", q->face, q->style, q->size, q->flags,
+		    (double)q->letter_spacing, q->upper, q->text, q->sep ? q->sep : "");
+	if (s->raster_key && strcmp(s->raster_key, key.array) == 0) {
+		dstr_free(&key);
+		request_free(q);
+		return;
 	}
-	obs_data_release(d);
+	bfree(s->raster_key);
+	s->raster_key = bstrdup(key.array);
+	dstr_free(&key);
+
+	long generation = os_atomic_inc_long(&s->raster_generation);
+	if (!s->loader) {
+		raster_publish(s, raster_build(q), generation);
+		request_free(q);
+		return;
+	}
+	struct ctt_raster_job *job = bzalloc(sizeof(*job));
+	job->s = s;
+	job->req = q;
+	job->generation = generation;
+	if (!os_task_queue_queue_task(s->loader, raster_task, job)) {
+		request_free(q);
+		bfree(job);
+	}
 }
 
 /* ------------------------------------------------------------ settings */
@@ -262,25 +324,19 @@ static void ctt_update(void *data, obs_data_t *settings)
 			c.height = 1080;
 	}
 
-	bool upper = obs_data_get_bool(settings, "uppercase");
-	/* The font picker's value, with every field written out: OBS copies
-	 * only explicitly set values into the text source's settings, so
-	 * fields that are just defaults would be lost on the way. */
-	obs_data_t *picked = obs_data_get_obj(settings, "font");
-	obs_data_t *font = obs_data_create();
-	obs_data_set_string(font, "face", obs_data_get_string(picked, "face"));
-	obs_data_set_string(font, "style", obs_data_get_string(picked, "style"));
-	obs_data_set_int(font, "size", obs_data_get_int(picked, "size"));
-	obs_data_set_int(font, "flags", obs_data_get_int(picked, "flags"));
-	obs_data_release(picked);
-	char *text = text_transform(obs_data_get_string(settings, "text"), upper);
-	char *sep = text_transform(obs_data_get_string(settings, "separator"), upper);
-	c.has_sep = !is_blank(sep);
-	text_source_set(s, s->text_src, &s->text_applied, font, text);
-	text_source_set(s, s->sep_src, &s->sep_applied, font, c.has_sep ? sep : "");
-	bfree(text);
-	bfree(sep);
+	struct ctt_text_request *q = bzalloc(sizeof(*q));
+	obs_data_t *font = obs_data_get_obj(settings, "font");
+	q->face = bstrdup(obs_data_get_string(font, "face"));
+	q->style = bstrdup(obs_data_get_string(font, "style"));
+	q->size = (int)obs_data_get_int(font, "size");
+	q->flags = (uint32_t)obs_data_get_int(font, "flags");
 	obs_data_release(font);
+	q->letter_spacing = (float)obs_data_get_double(settings, "letter_spacing");
+	q->upper = obs_data_get_bool(settings, "uppercase");
+	q->text = bstrdup(obs_data_get_string(settings, "text"));
+	const char *sep = obs_data_get_string(settings, "separator");
+	q->sep = is_blank(sep) ? NULL : bstrdup(sep);
+	raster_request(s, q);
 
 	c.word_gap = (float)obs_data_get_double(settings, "word_gap");
 	if (c.word_gap < 0.0f)
@@ -296,9 +352,10 @@ static void ctt_update(void *data, obs_data_t *settings)
 	c.grad_span = (int)obs_data_get_int(settings, "gradient_span");
 	c.grad_angle_deg = (float)obs_data_get_double(settings, "gradient_angle");
 	c.tone_amount = (float)obs_data_get_double(settings, "tone_amount") / 100.0f;
-	c.outline_px = obs_data_get_bool(settings, "outline_only")
-			       ? (float)obs_data_get_double(settings, "outline_width")
-			       : 0.0f;
+	if (obs_data_get_bool(settings, "outline_only")) {
+		double w = obs_data_get_double(settings, "outline_width");
+		c.outline_px = (float)(w < 0.0 ? 0.0 : (w > CTT_MAX_OUTLINE ? CTT_MAX_OUTLINE : w));
+	}
 
 	c.rotation_deg = (float)obs_data_get_double(settings, "rotation");
 	c.motion.speed = obs_data_get_double(settings, "speed");
@@ -343,23 +400,14 @@ static void *ctt_create_common(obs_data_t *settings, obs_source_t *source, bool 
 	s->row_pos = bzalloc(sizeof(double) * CTT_ROW_SLOTS);
 	s->row_buf = bzalloc(sizeof(float) * CTT_ROW_SLOTS);
 
-	const char *id = find_text_source_id();
-	if (id) {
-		s->text_is_ft2 = strncmp(id, "text_ft2", 8) == 0;
-		s->text_src = obs_source_create_private(id, "constellations-text-tiles-phrase", NULL);
-		s->sep_src = obs_source_create_private(id, "constellations-text-tiles-separator", NULL);
-	} else {
-		obs_log(LOG_WARNING, "Text Tiles: no OBS text source is available, so only the background is drawn");
-	}
-
 	if (cfx_effect_load(&s->fx, "text_tiles.effect", param_names, P_COUNT)) {
 		obs_enter_graphics();
-		s->text_tr = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
-		s->sep_tr = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
 		s->row_tex = gs_texture_create(CTT_ROW_SLOTS, 1, GS_R32F, 1, NULL, GS_DYNAMIC);
 		obs_leave_graphics();
 	}
+	/* The first raster is built here, before the loader exists. */
 	ctt_update(s, settings);
+	s->loader = os_task_queue_create();
 	return s;
 }
 
@@ -376,17 +424,18 @@ static void *ctt_filter_create(obs_data_t *settings, obs_source_t *source)
 static void ctt_destroy(void *data)
 {
 	struct ctt_source *s = data;
-	obs_source_release(s->text_src);
-	obs_source_release(s->sep_src);
+	/* Runs any raster still queued to completion first, so nothing is
+	 * left to write into the struct once it is gone. */
+	os_task_queue_destroy(s->loader);
+	raster_free(s->raster_ready);
 	obs_enter_graphics();
-	gs_texrender_destroy(s->text_tr);
-	gs_texrender_destroy(s->sep_tr);
+	gs_texture_destroy(s->text_field.tex);
+	gs_texture_destroy(s->sep_field.tex);
 	gs_texrender_destroy(s->tone_tr);
 	gs_texture_destroy(s->row_tex);
 	obs_leave_graphics();
 	cfx_effect_free(&s->fx);
-	bfree(s->text_applied);
-	bfree(s->sep_applied);
+	bfree(s->raster_key);
 	bfree(s->row_pos);
 	bfree(s->row_buf);
 	pthread_mutex_destroy(&s->mutex);
@@ -427,60 +476,64 @@ static void ctt_tick(void *data, float seconds)
 
 /* ------------------------------------------------------------ rendering */
 
-/* Renders a text source into its alpha mask. */
-static gs_texture_t *render_mask(gs_texrender_t *tr, obs_source_t *src, uint32_t *w, uint32_t *h)
+/* Replaces an uploaded field with a newly built one. Graphics context. */
+static void field_upload(struct ctt_field *f, const struct ctt_glyphs *g)
 {
-	*w = src ? obs_source_get_width(src) : 0;
-	*h = src ? obs_source_get_height(src) : 0;
-	if (!tr || *w == 0 || *h == 0 || *w > 16384 || *h > 16384)
-		return NULL;
-	gs_texrender_reset(tr);
-	if (!gs_texrender_begin(tr, *w, *h))
-		return NULL;
-	struct vec4 clear;
-	vec4_zero(&clear);
-	gs_clear(GS_CLEAR_COLOR, &clear, 0.0f, 0);
-	gs_ortho(0.0f, (float)*w, 0.0f, (float)*h, -100.0f, 100.0f);
-	/* OBS's standard blend, under which both text sources leave alpha
-	 * equal to the letters' coverage. */
-	gs_blend_state_push();
-	gs_enable_blending(true);
-	gs_blend_function_separate(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA, GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
-	obs_source_video_render(src);
-	gs_blend_state_pop();
-	gs_texrender_end(tr);
-	return gs_texrender_get_texture(tr);
+	gs_texture_destroy(f->tex);
+	memset(f, 0, sizeof(*f));
+	if (!g->sdf)
+		return;
+	const uint8_t *data = (const uint8_t *)g->sdf;
+	f->tex = gs_texture_create(g->tex_w, g->tex_h, GS_R16, 1, &data, 0);
+	f->box_w = g->box_w;
+	f->box_h = g->box_h;
+	vec4_set(&f->rect, g->tex_x, g->tex_y, g->tex_wpx, g->tex_hpx);
 }
 
-/* Renders the text masks and works out this frame's row layout into
- * s->frame. False when there is no text to draw. */
+/* Uploads a raster the loader has finished, if there is one. */
+static void ctt_take_raster(struct ctt_source *s)
+{
+	pthread_mutex_lock(&s->mutex);
+	struct ctt_raster *r = s->raster_ready;
+	s->raster_ready = NULL;
+	pthread_mutex_unlock(&s->mutex);
+	if (!r)
+		return;
+	field_upload(&s->text_field, &r->text);
+	field_upload(&s->sep_field, &r->sep);
+	raster_free(r);
+}
+
+/* Works out this frame's row layout into s->frame and uploads the rows'
+ * offsets. False when there is no text to draw. */
 static bool ctt_prepare(struct ctt_source *s, uint32_t width, uint32_t height)
 {
 	const struct ctt_config *c = &s->cfg;
 	struct ctt_frame *f = &s->frame;
 	memset(f, 0, sizeof(*f));
+	ctt_take_raster(s);
 
-	uint32_t tw, th, sw = 0, sh = 0;
-	f->text_tex = s->row_tex ? render_mask(s->text_tr, s->text_src, &tw, &th) : NULL;
-	if (!f->text_tex)
+	const struct ctt_field *text = &s->text_field;
+	const struct ctt_field *sep = &s->sep_field;
+	if (!s->row_tex || !text->tex)
 		return false;
-	f->sep_tex = c->has_sep ? render_mask(s->sep_tr, s->sep_src, &sw, &sh) : NULL;
-	bool has_sep = f->sep_tex != NULL;
+	bool has_sep = sep->tex != NULL;
 
-	double pitch = (double)th + (double)c->line_spacing;
-	if (pitch < 0.5 * (double)th)
-		pitch = 0.5 * (double)th;
+	double th = (double)text->box_h;
+	double pitch = th + (double)c->line_spacing;
+	if (pitch < 0.5 * th)
+		pitch = 0.5 * th;
 	if (pitch < 1.0)
 		pitch = 1.0;
 	double gap = (double)c->word_gap;
-	double sep_x = (double)tw + gap;
-	double period = sep_x + (has_sep ? (double)sw + gap : 0.0);
+	double sep_x = (double)text->box_w + gap;
+	double period = sep_x + (has_sep ? (double)sep->box_w + gap : 0.0);
 	if (period < 1.0)
 		period = 1.0;
 	s->last_period = period;
 
 	int first;
-	int count = ctt_row_range((double)width, (double)height, pitch, (double)th, &first);
+	int count = ctt_row_range((double)width, (double)height, pitch, th, &first);
 	if (count <= 0)
 		return false;
 	for (int i = 0; i < count; ++i) {
@@ -494,10 +547,6 @@ static bool ctt_prepare(struct ctt_source *s, uint32_t width, uint32_t height)
 	f->pitch = (float)pitch;
 	f->first = (float)first;
 	f->count = (float)count;
-	f->text_w = (float)tw;
-	f->text_h = (float)th;
-	f->sep_w = (float)sw;
-	f->sep_h = (float)sh;
 	f->sep_x = (float)sep_x;
 	f->period = (float)period;
 	f->has_sep = has_sep;
@@ -527,6 +576,8 @@ static void ctt_draw_text(struct ctt_source *s, uint32_t width, uint32_t height)
 {
 	const struct ctt_config *c = &s->cfg;
 	const struct ctt_frame *f = &s->frame;
+	const struct ctt_field *text = &s->text_field;
+	const struct ctt_field *sep = f->has_sep ? &s->sep_field : &s->text_field;
 	const struct cfx_effect *fx = &s->fx;
 
 	double rot = (double)c->rotation_deg * (M_PI / 180.0);
@@ -537,11 +588,14 @@ static void ctt_draw_text(struct ctt_source *s, uint32_t width, uint32_t height)
 	cfx_set_float(fx, P_ROW_FIRST, f->first);
 	cfx_set_float(fx, P_ROW_COUNT, f->count);
 	cfx_set_float(fx, P_ROW_TEX_W, (float)CTT_ROW_SLOTS);
-	cfx_set_vec2(fx, P_TEXT_SIZE, f->text_w, f->text_h);
-	cfx_set_vec2(fx, P_SEP_SIZE, f->sep_w, f->sep_h);
-	cfx_set_vec2(fx, P_SEP_POS, f->sep_x, 0.5f * (f->text_h - f->sep_h));
+	cfx_set_vec2(fx, P_TEXT_SIZE, text->box_w, text->box_h);
+	cfx_set_vec4(fx, P_TEXT_RECT, &text->rect);
+	cfx_set_vec2(fx, P_SEP_SIZE, sep->box_w, sep->box_h);
+	cfx_set_vec4(fx, P_SEP_RECT, &sep->rect);
+	cfx_set_vec2(fx, P_SEP_POS, f->sep_x, 0.5f * (text->box_h - sep->box_h));
 	cfx_set_float(fx, P_PERIOD, f->period);
 	cfx_set_float(fx, P_HAS_SEP, f->has_sep ? 1.0f : 0.0f);
+	cfx_set_float(fx, P_SDF_SPREAD, CTT_SDF_SPREAD);
 	cfx_set_float(fx, P_OUTLINE_PX, c->outline_px);
 	cfx_set_float(fx, P_FILL_MODE, (float)c->fill_mode);
 	cfx_set_vec4(fx, P_TEXT_COLOR, &c->color);
@@ -549,10 +603,10 @@ static void ctt_draw_text(struct ctt_source *s, uint32_t width, uint32_t height)
 	cfx_set_float(fx, P_GRAD_SPAN, (float)c->grad_span);
 	cfx_set_vec2(fx, P_GRAD_DIR, (float)cos(ga), (float)sin(ga));
 	cfx_set_float(fx, P_TONE_AMOUNT, fabsf(c->tone_amount));
-	if (fx->params[P_TEXT_MASK])
-		gs_effect_set_texture(fx->params[P_TEXT_MASK], f->text_tex);
-	if (fx->params[P_SEP_MASK])
-		gs_effect_set_texture(fx->params[P_SEP_MASK], f->has_sep ? f->sep_tex : f->text_tex);
+	if (fx->params[P_TEXT_SDF])
+		gs_effect_set_texture(fx->params[P_TEXT_SDF], text->tex);
+	if (fx->params[P_SEP_SDF])
+		gs_effect_set_texture(fx->params[P_SEP_SDF], sep->tex);
 	if (fx->params[P_ROW_OFFSETS])
 		gs_effect_set_texture(fx->params[P_ROW_OFFSETS], s->row_tex);
 
@@ -751,6 +805,8 @@ static obs_properties_t *ctt_props_common(void *data, bool is_filter)
 	obs_properties_add_font(text, "font", T("Font"));
 	p = obs_properties_add_text(text, "separator", T("Separator"), OBS_TEXT_DEFAULT);
 	obs_property_set_long_description(p, T("Separator.Tooltip"));
+	p = obs_properties_add_float_slider(text, "letter_spacing", T("LetterSpacing"), -50.0, 200.0, 0.5);
+	obs_property_float_set_suffix(p, " px");
 	p = obs_properties_add_float_slider(text, "word_gap", T("WordGap"), 0.0, 1000.0, 1.0);
 	obs_property_float_set_suffix(p, " px");
 	p = obs_properties_add_float_slider(text, "line_spacing", T("LineSpacing"), -500.0, 1000.0, 1.0);
@@ -779,7 +835,7 @@ static obs_properties_t *ctt_props_common(void *data, bool is_filter)
 	obs_property_set_long_description(p, is_filter ? T("ToneAmount.FilterTooltip") : T("ToneAmount.Tooltip"));
 	p = obs_properties_add_bool(style, "outline_only", T("OutlineOnly"));
 	obs_property_set_modified_callback(p, ctt_visibility);
-	p = obs_properties_add_float_slider(style, "outline_width", T("OutlineWidth"), 1.0, 20.0, 0.5);
+	p = obs_properties_add_float_slider(style, "outline_width", T("OutlineWidth"), 1.0, CTT_MAX_OUTLINE, 0.5);
 	obs_property_float_set_suffix(p, " px");
 	obs_properties_add_group(props, "style_group", T("Group.Style"), OBS_GROUP_NORMAL, style);
 
@@ -852,6 +908,7 @@ static void ctt_defaults_common(obs_data_t *settings)
 	obs_data_set_default_obj(settings, "font", font);
 	obs_data_release(font);
 	obs_data_set_default_string(settings, "separator", "");
+	obs_data_set_default_double(settings, "letter_spacing", 0.0);
 	obs_data_set_default_double(settings, "word_gap", 40.0);
 	obs_data_set_default_double(settings, "line_spacing", 0.0);
 

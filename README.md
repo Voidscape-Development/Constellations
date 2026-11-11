@@ -23,7 +23,9 @@ and repeat, or scattered across a grid. Each item can have its own size, rotatio
 random per-cell colors). Patterns can scroll, wander, twinkle and rotate, and a vignette can fade them out.
 
 Text Tiles repeats one phrase (with an optional separator such as • or ★) along rows, in any installed font picked
-through the standard OBS font dialog. Rows can all move the same way, alternate, or pick a random direction each, with
+through the standard OBS font dialog, with adjustable letter spacing. The text is laid out with Qt, so kerning, complex
+scripts and fallback fonts work, and drawn from a signed distance field, so it stays crisp at any rotation and outlines
+can be any width. Rows can all move the same way, alternate, or pick a random direction each, with
 per-row speed variation and an optional slow speed wander so rows drift past each other. A row stagger gives the
 stair-step look, and the whole pattern can be rotated. The text can be a solid color, a gradient across the canvas or
 along each word, or tone-on-tone (darkening or lightening whatever is behind it), filled or as outlines only. As a
@@ -60,7 +62,10 @@ cmake --build --preset ubuntu-x86_64
 |----------|--------------|
 | Windows | Visual Studio 18 2026, CMake 3.30.5 |
 | macOS | Xcode 26.5, CMake 3.30.5 |
-| Ubuntu 26.04 | CMake 3.28.3, `ninja-build`, `pkg-config`, `build-essential`, OBS Studio 33 development files |
+| Ubuntu 26.04 | CMake 3.28.3, `ninja-build`, `pkg-config`, `build-essential`, OBS Studio 33 development files, `qt6-base-dev` |
+
+The presets build with Qt (`ENABLE_QT`), which Text Tiles needs; Windows and macOS get it from the OBS dependencies the
+build downloads. Configured with `-DENABLE_QT=OFF`, the plugin builds without Text Tiles.
 
 See the plugin template wiki for the
 [build system options](https://github.com/obsproject/obs-plugintemplate/wiki/CMake-Build-System-Options).

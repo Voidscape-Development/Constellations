@@ -74,6 +74,22 @@ double ctt_row_start(int row, double stagger, bool random_offset, uint32_t seed,
  * the rows that are kept. Returns the row count (0 when nothing to draw). */
 int ctt_row_range(double width, double height, double pitch, double text_h, int *first);
 
+/* Signed distance fields ----------------------------------------------------
+ *
+ * The letters are drawn as a signed distance field: each texel holds how far
+ * its centre is from the nearest letter edge, negative inside the letters.
+ * Coverage at any scale or rotation, and an outline of any width, are then
+ * one texture read each. */
+
+/* Builds the field from an 8-bit coverage image (255 = inside) of w x h
+ * texels, each `texel_px` canvas px across. Distances are in canvas px,
+ * clamped to +-spread and encoded into 16 bits as 0.5 - d / (2 * spread), so
+ * 0.5 is the edge. Returns false when out of memory. */
+bool ctt_sdf_build(const uint8_t *coverage, int w, int h, float texel_px, float spread, uint16_t *out);
+
+/* Decodes one encoded value back to a distance in canvas px. */
+float ctt_sdf_decode(uint16_t v, float spread);
+
 #ifdef __cplusplus
 }
 #endif

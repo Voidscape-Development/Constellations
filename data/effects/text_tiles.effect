@@ -1,10 +1,12 @@
 // Constellations - Text Tiles Background / Filter
 //
 // One full-canvas pass draws every row of repeating text. The phrase and the
-// separator come in as alpha masks rendered by an OBS text source; each row's
-// sideways position is computed on the CPU (text-tiles-math.c) in double
-// precision, wrapped into one period, and handed over in row_offsets, one
-// texel per row.
+// separator come in as signed distance fields (text-tiles-raster.cpp): each
+// texel holds the distance to the nearest letter edge, so coverage and
+// outlines of any width are one sample each and stay sharp under rotation.
+// Each row's sideways position is computed on the CPU (text-tiles-math.c) in
+// double precision, wrapped into one period, and handed over in row_offsets,
+// one texel per row.
 //
 // Rows run along x after rotating the canvas about its centre. Row r is
 // centred on rotated y = r * row_pitch and is text_size.y tall; each repeats
@@ -20,11 +22,14 @@ uniform float row_first;       // row held in texel 0 of row_offsets
 uniform float row_count;       // rows held
 uniform float row_tex_w;       // width of row_offsets in texels
 
-uniform float2 text_size;      // phrase mask, px
-uniform float2 sep_size;       // separator mask, px
-uniform float2 sep_pos;        // separator's top left within the period, px
+uniform float2 text_size;      // phrase layout box, px
+uniform float4 text_rect;      // the phrase field's x, y, width, height in that box, px
+uniform float2 sep_size;       // separator layout box, px
+uniform float4 sep_rect;
+uniform float2 sep_pos;        // separator box's top left within the period, px
 uniform float period;          // px from one phrase to the next
 uniform float has_sep;
+uniform float sdf_spread;      // px the fields reach either side of an edge
 
 uniform float outline_px;      // 0 = filled letters
 uniform float fill_mode;       // 0 solid, 1 tone-on-tone, 2 gradient
@@ -40,8 +45,8 @@ uniform float4 bg_color2;
 uniform float bg_type;         // 0 solid, 1 radial, 2 linear
 uniform float2 bg_dir;
 
-uniform texture2d text_mask;
-uniform texture2d sep_mask;
+uniform texture2d text_sdf;    // R16: 0.5 - distance / (2 * spread)
+uniform texture2d sep_sdf;
 uniform texture2d row_offsets; // R32F, px each row has moved right, wrapped
 
 sampler_state MaskSampler {
@@ -110,40 +115,44 @@ float canvas_t(float2 px, float2 dir)
 
 // ---------------------------------------------------------------- text
 
-// Coverage of the repeating phrase/separator strip at p, in row-local px
-// (x along the row, y down from the row's top).
-float strip_cov(float2 p)
+// Distance in px from p (in a layout box) to the nearest edge of the phrase
+// or separator, negative inside; at least the spread outside the field.
+// One function per texture: OBS's GLSL translation only handles samples of
+// a texture uniform named directly, not one passed as a parameter.
+float field_uv_ok(float2 uv)
 {
-	if (p.y < 0.0 || p.y >= text_size.y)
-		return 0.0;
-	float x = wrapf(p.x, period);
-	if (x < text_size.x)
-		return text_mask.SampleLevel(MaskSampler, float2(x, p.y) / text_size, 0).a;
-	if (has_sep > 0.5) {
-		float2 s = float2(x, p.y) - sep_pos;
-		if (s.x >= 0.0 && s.x < sep_size.x && s.y >= 0.0 && s.y < sep_size.y)
-			return sep_mask.SampleLevel(MaskSampler, s / sep_size, 0).a;
-	}
-	return 0.0;
+	return (uv.x >= 0.0 && uv.y >= 0.0 && uv.x <= 1.0 && uv.y <= 1.0) ? 1.0 : 0.0;
 }
 
-// Outline only: the band between the letters grown and shrunk by half the
-// stroke, so the stroke is centred on the letters' edge.
-float outline_cov(float2 p)
+float text_sd(float2 p)
 {
-	float c = strip_cov(p);
-	float hi = c;
-	float lo = c;
-	float r = outline_px * 0.5;
-	for (int i = 0; i < 16; i++) {
-		float a = float(i) * 0.39269908;
-		float2 d = float2(cos(a), sin(a));
-		float o = strip_cov(p + d * r);
-		float n = strip_cov(p + d * (r * 0.5));
-		hi = max(hi, max(o, n));
-		lo = min(lo, min(o, n));
-	}
-	return saturate(hi - lo);
+	float2 uv = (p - text_rect.xy) / text_rect.zw;
+	if (field_uv_ok(uv) < 0.5)
+		return sdf_spread;
+	return (0.5 - text_sdf.SampleLevel(MaskSampler, uv, 0).r) * 2.0 * sdf_spread;
+}
+
+float sep_sd(float2 p)
+{
+	float2 uv = (p - sep_rect.xy) / sep_rect.zw;
+	if (field_uv_ok(uv) < 0.5)
+		return sdf_spread;
+	return (0.5 - sep_sdf.SampleLevel(MaskSampler, uv, 0).r) * 2.0 * sdf_spread;
+}
+
+// Distance from p, in row-local px (x along the row, y down from the row's
+// top), to the repeating phrase/separator strip. The neighbouring repeats
+// are checked too, so ink or an outline that reaches across the gap is not
+// cut off where the period wraps.
+float strip_sd(float2 p)
+{
+	float x = wrapf(p.x, period);
+	float d = text_sd(float2(x, p.y));
+	d = min(d, text_sd(float2(x - period, p.y)));
+	d = min(d, text_sd(float2(x + period, p.y)));
+	if (has_sep > 0.5)
+		d = min(d, sep_sd(float2(x, p.y) - sep_pos));
+	return d;
 }
 
 // Where along its own word p falls, 0..1, for gradients that span each word.
@@ -164,16 +173,15 @@ float word_t(float2 p)
 	return 0.0;
 }
 
-// x = coverage of row r at rotated point q, y = word gradient t.
+// x = distance from rotated point q to row r's letters, y = word gradient t.
 float2 row_sample(float2 q, float r)
 {
 	float i = r - row_first;
 	if (i < 0.0 || i >= row_count)
-		return float2(0.0, 0.0);
+		return float2(sdf_spread, 0.0);
 	float off = row_offsets.SampleLevel(RowSampler, float2((i + 0.5) / row_tex_w, 0.5), 0).r;
 	float2 p = float2(q.x - off, q.y - (r * row_pitch - 0.5 * text_size.y));
-	float cov = (outline_px > 0.0) ? outline_cov(p) : strip_cov(p);
-	return float2(cov, word_t(p));
+	return float2(strip_sd(p), word_t(p));
 }
 
 float4 PSText(VertData v_in) : TARGET
@@ -183,13 +191,18 @@ float4 PSText(VertData v_in) : TARGET
 	// Rotate the canvas back so rows run along x.
 	float2 q = float2(rot_cs.x * c.x + rot_cs.y * c.y, -rot_cs.y * c.x + rot_cs.x * c.y);
 
-	// Rows are at least half as far apart as they are tall, so at most
-	// two overlap any point.
+	// Rows are at least half as far apart as they are tall, so at most two
+	// overlap any point; the row below is checked as well for ink and
+	// outlines that reach past the layout box.
 	float r_hi = floor((q.y + 0.5 * text_size.y) / row_pitch);
 	float2 a = row_sample(q, r_hi);
 	float2 b = row_sample(q, r_hi - 1.0);
-	float2 s = (b.x > a.x) ? b : a;
-	float cov = s.x;
+	float2 c2 = row_sample(q, r_hi + 1.0);
+	float2 s = (b.x < a.x) ? b : a;
+	s = (c2.x < s.x) ? c2 : s;
+	// The canvas is drawn 1:1, so one px of distance is one px of edge.
+	float d = (outline_px > 0.0) ? abs(s.x) - 0.5 * outline_px : s.x;
+	float cov = saturate(0.5 - d);
 
 	if (fill_mode > 0.5 && fill_mode < 1.5)
 		return float4(tone_amount * cov, tone_amount * cov, tone_amount * cov, 0.0);
