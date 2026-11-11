@@ -21,13 +21,18 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include "shape-defs.h"
 #include "pattern-media.h"
+#include "glass-transition.h"
+#include "matte-transition.h"
+#include "portal-transition.h"
+#include "tiles-transition.h"
+#include "vortex-transition.h"
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 
 MODULE_EXPORT const char *obs_module_description(void)
 {
-	return "Constellations — tiled shape backgrounds, borders, and filters for OBS.";
+	return "Constellations — tiled shape backgrounds, borders, filters and scene transitions for OBS.";
 }
 
 MODULE_EXPORT const char *obs_module_name(void)
@@ -40,11 +45,14 @@ bool obs_module_load(void)
 	obs_log(LOG_INFO, "Constellations loading (version %s)", PLUGIN_VERSION);
 	cpat_media_init();
 	constellations_register_pattern_source();
-	constellations_register_topography_source();
-	constellations_register_topography_filter();
 	constellations_register_skylines();
 	constellations_register_pattern_filter();
 	constellations_register_pattern_border();
+	obs_register_source(&tiles_transition);
+	obs_register_source(&vortex_transition);
+	obs_register_source(&glass_transition);
+	obs_register_source(&matte_transition);
+	obs_register_source(&portal_transition);
 	obs_log(LOG_INFO, "Constellations loaded");
 	return true;
 }

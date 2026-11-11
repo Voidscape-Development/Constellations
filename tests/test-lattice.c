@@ -223,36 +223,6 @@ static void test_border(void)
 	      "empty row phase");
 }
 
-/* The split offsets must give the same lattice cell (mod the period) and
- * the same position inside it as evaluating each octave directly. */
-static void test_topo_offsets(void)
-{
-	const double period = 4096.0;
-	const double drifts[][2] = {{0.0, 0.0}, {3.7, -2.2}, {1234.5, -987.25}, {40000.3, 12345.6}, {-7.5e5, 3.1e5}};
-	for (size_t d = 0; d < sizeof(drifts) / sizeof(drifts[0]); ++d) {
-		float offs[CLAT_TOPO_OCTAVES][4];
-		clat_topo_octave_offsets(drifts[d][0], drifts[d][1], period, offs);
-		long double ox = drifts[d][0], oy = drifts[d][1];
-		for (int k = 0; k < CLAT_TOPO_OCTAVES; ++k) {
-			long double fx = floorl(ox), fy = floorl(oy);
-			double ix = fmod((double)fx, period), iy = fmod((double)fy, period);
-			if (ix < 0.0)
-				ix += period;
-			if (iy < 0.0)
-				iy += period;
-			CHECK(offs[k][0] == (float)ix && offs[k][1] == (float)iy, "octave %d cell (%f,%f) want (%f,%f)",
-			      k, offs[k][0], offs[k][1], ix, iy);
-			CHECK(fabs(offs[k][2] - (double)(ox - fx)) < 1e-4 &&
-				      fabs(offs[k][3] - (double)(oy - fy)) < 1e-4,
-			      "octave %d fraction", k);
-			long double nx = ox * 1.6L - oy * 1.2L + 31.4L;
-			long double ny = ox * 1.2L + oy * 1.6L + 31.4L;
-			ox = nx;
-			oy = ny;
-		}
-	}
-}
-
 int main(void)
 {
 	test_hash();
@@ -263,7 +233,6 @@ int main(void)
 	test_split_continuity();
 	test_visible_range();
 	test_border();
-	test_topo_offsets();
 	if (failures) {
 		fprintf(stderr, "%d check(s) failed\n", failures);
 		return 1;

@@ -124,15 +124,6 @@ void clat_border_point(const struct clat_border_row *row, float u, float *x, flo
 double clat_border_row_phase(double march, float row, float cell, float offset_along, bool alternating,
 			     float drift_amount, float drift_seed, bool stagger, float total);
 
-/* Topography Lines: octave k of the height field samples the noise lattice
- * at M^k * p + C_k, with M a rotate-and-scale by (1.6, 1.2) and C_k the
- * accumulated (31.4, 31.4) shifts. For a map offset (dx, dy) this returns,
- * per octave, the offset's whole lattice index wrapped at `period` (xy) and
- * its fraction (zw), computed in double so the shader only adds small
- * numbers however far the terrain has drifted. */
-#define CLAT_TOPO_OCTAVES 5
-void clat_topo_octave_offsets(double dx, double dy, double period, float out[CLAT_TOPO_OCTAVES][4]);
-
 #ifdef __cplusplus
 }
 #endif
