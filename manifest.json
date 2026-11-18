@@ -1,0 +1,18 @@
+{
+    "display_name": "Constellations",
+    "id": "7ae82172-cde1-415d-9e61-30e844a3c4b7",
+    "version": "0.1.0",
+    "authors": [
+        "Eion Dailey"
+    ],
+    "name": "constellations",
+    "description": "Animated pattern backgrounds, borders, overlays and scene transitions for OBS Studio 33 and later.",
+    "long_description": "Animated pattern backgrounds, borders, overlays and scene transitions for OBS Studio 33 and later.",
+    "urls": {
+        "repository": "https://github.com/Voidscape-Development/Constellations",
+        "website": "https://github.com/Voidscape-Development/Constellations",
+        "support": "https://github.com/Voidscape-Development/Constellations/issues"
+    },
+    "has_banner": false,
+    "has_icon": false
+}
