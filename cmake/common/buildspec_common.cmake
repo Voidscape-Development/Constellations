@@ -81,9 +81,12 @@ function(_setup_obs_studio)
     COMMAND "${CMAKE_COMMAND}" --build build_${arch} --target obs-frontend-api --config Debug --parallel
     WORKING_DIRECTORY "${dependencies_dir}/${_obs_destination}"
     RESULT_VARIABLE _process_result
-    COMMAND_ERROR_IS_FATAL ANY
-    OUTPUT_QUIET
+    OUTPUT_VARIABLE _process_output
+    ERROR_VARIABLE _process_output
   )
+  if(NOT _process_result EQUAL 0)
+    message(FATAL_ERROR "Building ${label} (Debug - ${arch}) failed:\n${_process_output}")
+  endif()
   message(STATUS "Build ${label} (Debug - ${arch}) - done")
 
   message(STATUS "Build ${label} (Release - ${arch})")
@@ -91,9 +94,12 @@ function(_setup_obs_studio)
     COMMAND "${CMAKE_COMMAND}" --build build_${arch} --target obs-frontend-api --config Release --parallel
     WORKING_DIRECTORY "${dependencies_dir}/${_obs_destination}"
     RESULT_VARIABLE _process_result
-    COMMAND_ERROR_IS_FATAL ANY
-    OUTPUT_QUIET
+    OUTPUT_VARIABLE _process_output
+    ERROR_VARIABLE _process_output
   )
+  if(NOT _process_result EQUAL 0)
+    message(FATAL_ERROR "Building ${label} (Release - ${arch}) failed:\n${_process_output}")
+  endif()
   message(STATUS "Build ${label} (Reelase - ${arch}) - done")
 
   message(STATUS "Install ${label} (${arch})")
