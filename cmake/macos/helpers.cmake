@@ -79,8 +79,7 @@ function(target_install_resources target)
     file(GLOB_RECURSE data_files "${CMAKE_CURRENT_SOURCE_DIR}/data/*")
     foreach(data_file IN LISTS data_files)
       cmake_path(
-        RELATIVE_PATH
-        data_file
+        RELATIVE_PATH data_file
         BASE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/data/"
         OUTPUT_VARIABLE relative_path
       )
@@ -89,6 +88,10 @@ function(target_install_resources target)
       set_property(SOURCE "${data_file}" PROPERTY MACOSX_PACKAGE_LOCATION "Resources/${relative_path}")
       source_group("Resources/${relative_path}" FILES "${data_file}")
     endforeach()
+
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/manifest.json")
+      target_add_resource(${target} "${CMAKE_CURRENT_SOURCE_DIR}/manifest.json")
+    endif()
   endif()
 endfunction()
 

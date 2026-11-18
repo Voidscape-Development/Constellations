@@ -108,8 +108,8 @@ jobs:
           : Set Up Environment 🔧
           if (( ${+RUNNER_DEBUG} )) setopt XTRACE
 
-          print '::group::Enable Xcode 26.5'
-          sudo xcode-select --switch /Applications/Xcode_26.5.app/Contents/Developer
+          print '::group::Xcode Version'
+          xcodebuild -version
           print '::endgroup::'
 
           print '::group::Clean Homebrew Environment'
@@ -257,7 +257,7 @@ jobs:
         with:
           target: x86_64
           config: ${{ needs.check-event.outputs.config }}
-          package: ${{ fromJSON(needs.check-event.outputs.package) }}
+          package: true
 
       - name: Upload Source Tarball 🗜️
         uses: actions/upload-artifact@v4
@@ -330,9 +330,3 @@ jobs:
         with:
           name: ${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-windows-x64-${{ needs.check-event.outputs.commitHash }}
           path: ${{ github.workspace }}/release/${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-windows-x64*.*
-
-      - name: Upload Portable Artifacts 📡
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-windows-x64-Portable-${{ needs.check-event.outputs.commitHash }}
-          path: ${{ github.workspace }}/release-portable/${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-windows-x64-Portable.zip
