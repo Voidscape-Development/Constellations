@@ -73,8 +73,6 @@ jobs:
 
           variants=(
             'windows-x64;zip|exe'
-            'windows-legacy-x64;zip'
-            'windows-portable-legacy-x64;zip'
             'macos-universal;tar.xz|pkg'
             'ubuntu-26.04-x86_64;tar.xz|deb|ddeb'
             'sources;tar.xz'
@@ -151,8 +149,6 @@ jobs:
 
           variants=(
             'windows-x64;zip|exe'
-            'windows-legacy-x64;zip'
-            'windows-portable-legacy-x64;zip'
             'macos-universal;tar.xz|pkg'
             'ubuntu-26.04-x86_64;tar.xz|deb|ddeb'
             'sources;tar.xz'
