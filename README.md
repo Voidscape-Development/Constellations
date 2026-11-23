@@ -10,6 +10,7 @@ Animated pattern backgrounds, borders, overlays and scene transitions for [OBS S
 | **Pattern Filter** | Filter | The same patterns drawn over any source. |
 | **Pattern Border** | Filter | A frame of shapes around a source, inside its edges or grown outside them, with rounded corners. |
 | **Skylines Background** | Source and filter | A flat-look city skyline with lit windows, drift and window twinkle. |
+| **Blueprint Background** | Source and filter | A drafting grid of minor and major lines, dots or crosses on blueprint paper, with grain, vignette, rotation and scrolling. |
 | **Text Tiles Background** | Source and filter | A phrase repeated in rows across the canvas, each row sliding at its own speed and direction. |
 | **Tiling Transition** | Transition | The screen is divided into a lattice of shapes that animate in sequence to carry you to the next scene. |
 | **Vortex Transition** | Transition | A spiral portal tears open over the outgoing scene, swallows the canvas, and lets the incoming one in through the smoke. |

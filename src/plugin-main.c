@@ -46,6 +46,7 @@ bool obs_module_load(void)
 	cpat_media_init();
 	constellations_register_pattern_source();
 	constellations_register_skylines();
+	constellations_register_blueprint();
 	constellations_register_pattern_filter();
 	constellations_register_pattern_border();
 #ifdef CONSTELLATIONS_HAS_QT
