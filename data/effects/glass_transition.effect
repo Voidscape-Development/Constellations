@@ -119,7 +119,15 @@ struct GlassVertOut {
 	float4 edge  : TEXCOORD1; /* refraction direction.xy, core, crack */
 	float4 light : TEXCOORD2; /* shard normal.xyz, alpha */
 	float4 look  : TEXCOORD3; /* inradius, crack flash, reveal, tint */
+	float  side  : TEXCOORD4; /* +1 where the nearest edge faces the light, -1 away */
 };
+
+/* The one light everything is lit by: up and to the left of the pane, the side
+ * the glint sweeps in from, so the bevels, the shading and the sweep agree. */
+float3 light_dir()
+{
+	return normalize(float3(-glint_dir, 1.0));
+}
 
 GlassVertOut VSGlass(GlassVertIn v_in)
 {
@@ -148,7 +156,6 @@ GlassVertOut VSGlass(GlassVertIn v_in)
 	float2 screen = centre + (world.xy - centre) * persp;
 
 	vert_out.pos = mul(float4(screen, 0.0, 1.0), ViewProj);
-	vert_out.uv = v_in.uv;
 
 	/*
 	 * Towards the centre of the shard, as a unit vector in pixels. It is
@@ -171,6 +178,20 @@ GlassVertOut VSGlass(GlassVertIn v_in)
 	 */
 	vert_out.edge.w = st.crack * st.settle;
 
+	/*
+	 * Each piece is its own slab, so it shows the scene a little off from
+	 * its neighbours - a random nudge once it breaks, plus the parallax of
+	 * looking through it at a tilt. Both go with the glass term, so the
+	 * pane at rest samples exactly where it always did.
+	 */
+	float2 nudge = (v_in.rnd.yz - 0.5) * 1.5 + normal.xy * 0.8;
+	vert_out.uv = v_in.uv + nudge * refract_px * vert_out.edge.w / canvas;
+
+	/* The bevel faces out of the shard, so it is lit where the outward
+	 * direction - turned with the shard - points back at the light. */
+	float2 out_dir = rotate_axis(float3(-vert_out.edge.xy, 0.0), st.axis, st.angle).xy;
+	vert_out.side = dot(out_dir, -glint_dir);
+
 	vert_out.light.xyz = normal;
 	vert_out.light.w = st.alpha;
 
@@ -180,6 +201,17 @@ GlassVertOut VSGlass(GlassVertIn v_in)
 	vert_out.look.w = v_in.rnd.x;
 
 	return vert_out;
+}
+
+/* What a shard shows at uv: its own scene, or for the wipe, where nothing moves
+ * and the shard changes scene where it stands, the two mid change. */
+float4 scene_at(float2 uv, float reveal)
+{
+	if (style == STYLE_WIPE)
+		return lerp(a_tex.Sample(textureSampler, uv), b_tex.Sample(textureSampler, uv), reveal);
+	if (use_b)
+		return b_tex.Sample(textureSampler, uv);
+	return a_tex.Sample(textureSampler, uv);
 }
 
 float4 PSGlass(GlassVertOut v_in) : TARGET
@@ -204,19 +236,13 @@ float4 PSGlass(GlassVertOut v_in) : TARGET
 	/* Through the thick of the break the scene pulls towards the middle of
 	 * the shard, hardest right at the edge. */
 	float bend = lit * refract_px * (1.0 - core) * (1.0 - core);
-	float2 uv = v_in.uv + v_in.edge.xy * bend / canvas;
+	float2 shift = v_in.edge.xy * bend / canvas;
 
-	float4 scene;
-
-	if (style == STYLE_WIPE) {
-		/* nothing moves: the shard changes scene where it stands, and
-		 * the crack lines are all that mark the break out */
-		scene = lerp(a_tex.Sample(textureSampler, uv), b_tex.Sample(textureSampler, uv), v_in.look.z);
-	} else if (use_b) {
-		scene = b_tex.Sample(textureSampler, uv);
-	} else {
-		scene = a_tex.Sample(textureSampler, uv);
-	}
+	/* Thick glass splits the light as it bends it, red least and blue most,
+	 * which is the rainbow fringe along every edge. */
+	float4 scene = scene_at(v_in.uv + shift, v_in.look.z);
+	scene.r = scene_at(v_in.uv + shift * 0.6, v_in.look.z).r;
+	scene.b = scene_at(v_in.uv + shift * 1.4, v_in.look.z).b;
 
 	float3 col = scene.rgb;
 
@@ -225,13 +251,31 @@ float4 PSGlass(GlassVertOut v_in) : TARGET
 	float facing = saturate(abs(v_in.light.z));
 	float glance = 1.0 - facing;
 
+	/*
+	 * Shade the slab by how it faces the light, measured against how the
+	 * pane at rest faces it so an untilted shard is left alone. Glass is
+	 * seen from either side, so the normal is turned towards the camera.
+	 */
+	float3 L = light_dir();
+	float3 n = v_in.light.xyz * (v_in.light.z < 0.0 ? -1.0 : 1.0);
+	col *= max(1.0 + 0.5 * lit * (dot(n, L) - L.z), 0.45);
+
+	/* the mirror flash as a turning shard catches the light square on */
+	float3 h = normalize(L + float3(0.0, 0.0, 1.0));
+	float spec = saturate(pow(saturate(dot(n, h)), 60.0) - pow(h.z, 60.0));
+	col += crack_color.rgb * spec * glint_amount * lit * 2.0;
+
 	/* per shard brightness spread, so the break does not read as one image
 	 * cut up but as many pieces of glass */
 	col *= 1.0 + tint_amount * (v_in.look.w - 0.5) * 2.0 * lit;
 
-	/* the lit bevel along every cut edge */
-	float rim = 1.0 - smoothstep(0.0, max(rim_px, 0.5), dist);
-	col += crack_color.rgb * rim * rim_amount * lit * (0.45 + 1.1 * glance);
+	/* The bevel along every cut edge: the face turned to the light burns,
+	 * the one turned away falls into shadow, which is what gives the shard
+	 * a thickness instead of an outline. */
+	float rim = (1.0 - smoothstep(0.0, max(rim_px, 0.5), dist)) * lit;
+	float lit_side = saturate(v_in.side);
+	col += crack_color.rgb * rim * rim_amount * (0.45 + 1.1 * glance) * (0.4 + 1.6 * lit_side);
+	col *= 1.0 - 0.5 * rim * saturate(-v_in.side);
 
 	/* the crack itself: a hairline that burns as it runs through. Not called
 	 * `line` - that is a reserved word in HLSL, and the effect fails to load */
