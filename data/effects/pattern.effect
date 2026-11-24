@@ -361,7 +361,10 @@ float border_shape_mask(float2 px)
 
 float masks(float2 px)
 {
-	return vignette_mask(px) * border_shape_mask(px);
+	// Quads near an edge reach past the canvas; OBS only clips a source
+	// when its scene item crops or scales it, so clip here.
+	float2 inside = step(0.0, px) * step(px, canvas_size);
+	return inside.x * inside.y * vignette_mask(px) * border_shape_mask(px);
 }
 
 // ------------------------------------------------------------- placement

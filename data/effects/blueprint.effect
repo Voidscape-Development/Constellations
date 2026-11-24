@@ -1,0 +1,92 @@
+// Constellations - Blueprint grid
+// (c) 2026 Eion Dailey - GPLv2+
+
+uniform float4x4 ViewProj;
+
+uniform float2 canvas_size;
+uniform float2 grid_rot;     // cos, sin of the grid rotation
+uniform float2 grid_offset;  // scroll in px, wrapped by the CPU at one major period
+uniform float cell_size;     // minor spacing in px
+uniform float major_every;   // minor cells per major cell, < 2 = no major lines
+uniform float grid_style;    // 0 lines, 1 dots, 2 crosses
+uniform float minor_width;
+uniform float major_width;
+uniform float4 bg_color;     // sRGB-encoded, like every color here
+uniform float4 minor_color;
+uniform float4 major_color;
+uniform float grain;
+uniform float vignette;
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData v_out;
+	v_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	v_out.uv  = v_in.uv;
+	return v_out;
+}
+
+float srgb_to_linear(float c)
+{
+	return (c <= 0.04045) ? (c / 12.92) : pow((c + 0.055) / 1.055, 2.4);
+}
+
+float4 blend_over(float4 dst, float4 src)
+{
+	float a = src.a + dst.a * (1.0 - src.a);
+	if (a < 1.0e-5)
+		return float4(0.0, 0.0, 0.0, 0.0);
+	return float4((src.rgb * src.a + dst.rgb * dst.a * (1.0 - src.a)) / a, a);
+}
+
+// Anti-aliased coverage of a grid of the given period at p: lines, dots at
+// the intersections, or crosses with arms `arm` px long.
+float grid_cov(float2 p, float period, float width, float arm)
+{
+	float2 d = abs(p - period * floor(p / period + 0.5));
+	float2 c = saturate(width * 0.5 + 0.5 - d);
+	if (grid_style < 0.5)
+		return max(c.x, c.y);
+	if (grid_style < 1.5)
+		return saturate(width * 0.5 + 0.5 - length(d));
+	float2 a = saturate(arm + 0.5 - d.yx);
+	return max(c.x * a.x, c.y * a.y);
+}
+
+float4 PSBlueprint(VertData v_in) : TARGET
+{
+	float2 px = v_in.uv * canvas_size;
+	float2 q = px - canvas_size * 0.5;
+	float2 p = float2(q.x * grid_rot.x + q.y * grid_rot.y, q.y * grid_rot.x - q.x * grid_rot.y) - grid_offset;
+	float cs = max(cell_size, 2.0);
+
+	float4 c = bg_color;
+	// Paper grain: one hash per pixel, a few codes either way.
+	float n = frac(sin(dot(floor(px), float2(12.9898, 78.233))) * 43758.5453) - 0.5;
+	c.rgb = saturate(c.rgb + n * grain * 0.08);
+
+	c = blend_over(c, float4(minor_color.rgb, minor_color.a * grid_cov(p, cs, minor_width, cs * 0.2)));
+	if (major_every > 1.5)
+		c = blend_over(c, float4(major_color.rgb,
+					 major_color.a * grid_cov(p, cs * major_every, major_width, cs * 0.35)));
+
+	// Darkens toward the corners like an aged print.
+	float r = length(v_in.uv - 0.5) * 1.4142136;
+	c.rgb *= 1.0 - vignette * r * r;
+
+	float3 lin = float3(srgb_to_linear(c.r), srgb_to_linear(c.g), srgb_to_linear(c.b));
+	return float4(lin * c.a, c.a);
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSBlueprint(v_in);
+	}
+}
