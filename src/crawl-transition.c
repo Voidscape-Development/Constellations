@@ -24,12 +24,13 @@ struct crawl_info {
 	struct transition_base base;
 
 	gs_eparam_t *ep_a_tex, *ep_b_tex, *ep_text_sdf, *ep_canvas, *ep_progress, *ep_easing, *ep_rows, *ep_bar_w,
-		*ep_stagger, *ep_direction, *ep_has_text, *ep_text_size, *ep_text_rect, *ep_period, *ep_text_scale,
-		*ep_sdf_spread, *ep_bar_color, *ep_text_color;
+		*ep_stagger, *ep_hold, *ep_direction, *ep_has_text, *ep_text_size, *ep_text_rect, *ep_period,
+		*ep_text_scale, *ep_sdf_spread, *ep_bar_color, *ep_text_color;
 
 	pthread_mutex_t mutex;
 	int rows, easing, direction;
-	float bar_w, stagger, fill;
+	bool cover; /* Text Cover: whole lines slide in, hold, slide out */
+	float bar_w, stagger, fill, hold;
 	uint32_t bar_rgba, text_rgba;
 	char palette[64];
 	struct ctt_glyphs pending, glyphs; /* pending is uploaded on the next frame */
@@ -47,6 +48,7 @@ static const struct tc_param crawl_params[] = {
 	TC_PARAM(struct crawl_info, ep_rows, "rows"),
 	TC_PARAM(struct crawl_info, ep_bar_w, "bar_w"),
 	TC_PARAM(struct crawl_info, ep_stagger, "stagger"),
+	TC_PARAM(struct crawl_info, ep_hold, "hold"),
 	TC_PARAM(struct crawl_info, ep_direction, "direction"),
 	TC_PARAM(struct crawl_info, ep_has_text, "has_text"),
 	TC_PARAM(struct crawl_info, ep_text_size, "text_size"),
@@ -62,6 +64,12 @@ static const char *crawl_get_name(void *type_data)
 {
 	UNUSED_PARAMETER(type_data);
 	return obs_module_text("Crawl.Transition");
+}
+
+static const char *cover_get_name(void *type_data)
+{
+	UNUSED_PARAMETER(type_data);
+	return obs_module_text("Cover.Transition");
 }
 
 static void crawl_update(void *data, obs_data_t *settings)
@@ -89,6 +97,7 @@ static void crawl_update(void *data, obs_data_t *settings)
 	c->direction = (int)obs_data_get_int(settings, "direction");
 	c->bar_w = (float)obs_data_get_double(settings, "bar_width") / 100.0f;
 	c->stagger = (float)obs_data_get_double(settings, "stagger") / 100.0f;
+	c->hold = (float)obs_data_get_double(settings, "hold") / 100.0f;
 	c->fill = (float)obs_data_get_double(settings, "text_fill") / 100.0f;
 	c->bar_rgba = (uint32_t)obs_data_get_int(settings, "bar_color") | 0xFF000000;
 	c->text_rgba = (uint32_t)obs_data_get_int(settings, "text_color") | 0xFF000000;
@@ -104,6 +113,7 @@ static void *crawl_create(obs_data_t *settings, obs_source_t *source)
 		return NULL;
 	}
 	pthread_mutex_init(&c->mutex, NULL);
+	c->cover = strcmp(obs_source_get_id(source), "constellations_cover_transition") == 0;
 	crawl_update(c, settings);
 	return c;
 }
@@ -156,7 +166,8 @@ static void crawl_callback(void *data, gs_texture_t *a, gs_texture_t *b, float t
 	gs_effect_set_float(c->ep_progress, t);
 	gs_effect_set_float(c->ep_easing, (float)c->easing);
 	gs_effect_set_float(c->ep_rows, rows);
-	gs_effect_set_float(c->ep_bar_w, c->bar_w * (float)cx);
+	gs_effect_set_float(c->ep_bar_w, c->cover ? (float)cx : c->bar_w * (float)cx);
+	gs_effect_set_float(c->ep_hold, c->cover ? clampf(c->hold, 0.0f, 0.9f) : -1.0f);
 	gs_effect_set_float(c->ep_stagger, clampf(c->stagger, 0.0f, 0.9f));
 	gs_effect_set_float(c->ep_direction, (float)c->direction);
 	gs_effect_set_float(c->ep_has_text, c->tex && g->box_h > 0.0f ? 1.0f : 0.0f);
@@ -181,9 +192,8 @@ static void crawl_video_render(void *data, gs_effect_t *effect)
 	obs_transition_video_render(c->base.source, crawl_callback);
 }
 
-static obs_properties_t *crawl_properties(void *data)
+static obs_properties_t *props_common(bool cover)
 {
-	UNUSED_PARAMETER(data);
 	obs_properties_t *props = obs_properties_create();
 	obs_property_t *p;
 #define T(k) obs_module_text("Crawl." k)
@@ -207,8 +217,14 @@ static obs_properties_t *crawl_properties(void *data)
 	obs_property_list_add_int(p, obs_module_text("Tiles.Easing.Out"), 2);
 	SLIDER("stagger", "Stagger", 0.0, 90.0, 1.0, " %");
 	obs_property_set_long_description(p, T("Stagger.Description"));
-	SLIDER("bar_width", "BarWidth", 5.0, 200.0, 1.0, " %");
-	obs_property_set_long_description(p, T("BarWidth.Description"));
+	if (cover) {
+		p = obs_properties_add_float_slider(props, "hold", obs_module_text("Cover.Hold"), 0.0, 90.0, 1.0);
+		obs_property_float_set_suffix(p, " %");
+		obs_property_set_long_description(p, obs_module_text("Cover.Hold.Description"));
+	} else {
+		SLIDER("bar_width", "BarWidth", 5.0, 200.0, 1.0, " %");
+		obs_property_set_long_description(p, T("BarWidth.Description"));
+	}
 	SLIDER("text_fill", "TextFill", 10.0, 100.0, 1.0, " %");
 	obs_property_set_long_description(p, T("TextFill.Description"));
 	obs_properties_add_color(props, "bar_color", T("BarColor"));
@@ -218,6 +234,18 @@ static obs_properties_t *crawl_properties(void *data)
 #undef SLIDER
 #undef T
 	return props;
+}
+
+static obs_properties_t *crawl_properties(void *data)
+{
+	UNUSED_PARAMETER(data);
+	return props_common(false);
+}
+
+static obs_properties_t *cover_properties(void *data)
+{
+	UNUSED_PARAMETER(data);
+	return props_common(true);
 }
 
 static void crawl_defaults(obs_data_t *settings)
@@ -240,6 +268,14 @@ static void crawl_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "text_color", 0xFFFFFFFF);
 }
 
+static void cover_defaults(obs_data_t *settings)
+{
+	crawl_defaults(settings);
+	obs_data_set_default_int(settings, "rows", 3);
+	obs_data_set_default_double(settings, "stagger", 20.0);
+	obs_data_set_default_double(settings, "hold", 35.0);
+}
+
 struct obs_source_info crawl_transition = {
 	.id = "constellations_crawl_transition",
 	.type = OBS_SOURCE_TYPE_TRANSITION,
@@ -251,5 +287,19 @@ struct obs_source_info crawl_transition = {
 	.audio_render = tc_audio_render,
 	.get_properties = crawl_properties,
 	.get_defaults = crawl_defaults,
+	.video_get_color_space = tc_video_get_color_space,
+};
+
+struct obs_source_info cover_transition = {
+	.id = "constellations_cover_transition",
+	.type = OBS_SOURCE_TYPE_TRANSITION,
+	.get_name = cover_get_name,
+	.create = crawl_create,
+	.destroy = crawl_destroy,
+	.update = crawl_update,
+	.video_render = crawl_video_render,
+	.audio_render = tc_audio_render,
+	.get_properties = cover_properties,
+	.get_defaults = cover_defaults,
 	.video_get_color_space = tc_video_get_color_space,
 };

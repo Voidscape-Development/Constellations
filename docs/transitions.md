@@ -421,6 +421,17 @@ Every row's bar starts just off the canvas and ends just past it, and the
 stagger is taken out of each row's own time, so both ends are exactly one
 scene.
 
+## Text Cover Transition
+
+Text Crawl's sibling: each row's bar is a whole line. The lines slide in until
+they cover the canvas, hold while the scenes swap underneath, then slide on out
+the other side, leaving the incoming scene behind them.
+
+It has Text Crawl's settings, with **Hold** in place of **Bar Length**: how
+long the lines cover the screen, as a share of the transition. Stagger applies
+to the slide in and the slide out separately, so every row is in place for the
+whole hold.
+
 ## How the transitions are tested
 
 CI runs every suite below on each pull request: the CPU tests directly, and the GPU checks on a software rasteriser
