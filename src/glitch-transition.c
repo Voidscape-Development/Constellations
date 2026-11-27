@@ -12,6 +12,7 @@ the Free Software Foundation; either version 2 of the License, or
  * settings into uniforms. */
 
 #include <obs-module.h>
+#include <stdio.h>
 #include <util/threading.h>
 #include <math.h>
 
