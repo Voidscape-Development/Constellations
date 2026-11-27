@@ -45,9 +45,6 @@ enum ctt_gradient_span {
 	CTT_SPAN_WORD = 1,
 };
 
-/* How far, in canvas px, the distance fields reach either side of an edge.
- * Half the widest outline plus a pixel for its anti-aliasing must fit. */
-#define CTT_SDF_SPREAD 12.0f
 #define CTT_MAX_OUTLINE 20.0
 
 enum {
@@ -89,14 +86,6 @@ static const char *const param_names[] = {
 	"bg_color",    "bg_color2", "bg_type",    "bg_dir",      "text_sdf",  "sep_sdf",   "row_offsets",
 };
 _Static_assert(OBS_COUNTOF(param_names) == P_COUNT, "param_names must list every P_ uniform");
-
-#if defined(_WIN32)
-#define CTT_DEFAULT_FACE "Arial"
-#elif defined(__APPLE__)
-#define CTT_DEFAULT_FACE "Helvetica"
-#else
-#define CTT_DEFAULT_FACE "Sans Serif"
-#endif
 
 struct ctt_config {
 	uint32_t width, height;

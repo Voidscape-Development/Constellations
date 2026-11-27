@@ -1,0 +1,104 @@
+/*
+ * Constellations - Text Crawl transition.
+ *
+ * The canvas is cut into rows, and a ticker bar carrying a repeated phrase
+ * slides along each one, rows staggered: the outgoing scene is ahead of the
+ * bar and the incoming one behind it. Every row's bar starts just off the
+ * canvas and ends just past it, so the first and last frames are the two
+ * scenes exactly.
+ */
+
+uniform float4x4 ViewProj;
+uniform texture2d a_tex;
+uniform texture2d b_tex;
+uniform texture2d text_sdf;    /* R16: 0.5 - distance / (2 * spread) */
+
+uniform float2 canvas;
+uniform float progress;
+uniform float easing;          /* 0 linear, 1 in and out, 2 out */
+uniform float rows;
+uniform float bar_w;           /* px */
+uniform float stagger;         /* share of the transition the last row waits */
+uniform float direction;       /* 0 left to right, 1 right to left, 2 alternate */
+uniform float has_text;
+uniform float2 text_size;      /* phrase layout box, layout px */
+uniform float4 text_rect;      /* the field's x, y, width, height in that box */
+uniform float period;          /* layout px from one phrase to the next */
+uniform float text_scale;      /* canvas px per layout px */
+uniform float sdf_spread;
+uniform float4 bar_color;
+uniform float4 text_color;
+
+sampler_state textureSampler {
+	Filter   = Linear;
+	AddressU = Clamp;
+	AddressV = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData v_out;
+	v_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	v_out.uv  = v_in.uv;
+	return v_out;
+}
+
+float ease(float t)
+{
+	if (easing > 1.5)
+		return 1.0 - (1.0 - t) * (1.0 - t);
+	if (easing > 0.5)
+		return t * t * (3.0 - 2.0 * t);
+	return t;
+}
+
+/* Coverage of the phrase at p, in layout px. */
+float text_cover(float2 p)
+{
+	float2 uv = (p - text_rect.xy) / text_rect.zw;
+	if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0)
+		return 0.0;
+	float sd = (0.5 - text_sdf.SampleLevel(textureSampler, uv, 0.0).r) * 2.0 * sdf_spread;
+	return saturate(0.5 - sd * text_scale);
+}
+
+float4 PSCrawl(VertData v_in) : TARGET
+{
+	float2 px = v_in.uv * canvas;
+	float row_h = canvas.y / rows;
+	float row = min(floor(px.y / row_h), rows - 1.0);
+	bool back = direction > 1.5 ? fmod(row, 2.0) > 0.5 : direction > 0.5;
+	float x = back ? canvas.x - px.x : px.x;
+
+	float delay = rows > 1.0 ? stagger * row / (rows - 1.0) : 0.0;
+	float p = saturate((progress - delay) / max(1.0 - stagger, 0.0001));
+	float lead = ease(p) * (canvas.x + bar_w);
+
+	float4 a = a_tex.SampleLevel(textureSampler, v_in.uv, 0.0);
+	float4 b = b_tex.SampleLevel(textureSampler, v_in.uv, 0.0);
+	float4 bar = bar_color;
+	if (has_text > 0.5) {
+		/* the phrase rides on the bar, each row's copies set off by their own amount */
+		float gx = (back ? lead - x : x - lead) / text_scale + frac(sin(row * 12.9898) * 43758.5453) * period;
+		float2 g = float2(gx - floor(gx / period) * period,
+				  (px.y - (row + 0.5) * row_h) / text_scale + 0.5 * text_size.y);
+		bar = lerp(bar, text_color, text_cover(g));
+	}
+
+	float4 c = lerp(a, bar, saturate(lead - x + 0.5));
+	return lerp(c, b, saturate(lead - bar_w - x + 0.5));
+}
+
+technique Crawl
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSCrawl(v_in);
+	}
+}

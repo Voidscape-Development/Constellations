@@ -72,12 +72,14 @@ target_sources(
     src/portal-transition.c
     src/ink-transition.c
     src/glitch-transition.c
+    src/ripple-transition.c
+    src/blackhole-transition.c
 )
 
 # Text Tiles lays its text out with Qt, so it is only built with Qt enabled
 # (the presets enable it).
 if(ENABLE_QT)
-  target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/text-tiles-source.c src/text-tiles-raster.cpp)
+  target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/text-tiles-source.c src/text-tiles-raster.cpp src/crawl-transition.c)
   target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE CONSTELLATIONS_HAS_QT)
 endif()
 
@@ -144,6 +146,9 @@ if(ENABLE_GPU_TESTS)
   # so it runs the plugin's own code between the settings and the effects.
   add_gpu_check(plugin-check tests/plugin-check.c)
   add_dependencies(plugin-check ${CMAKE_PROJECT_NAME})
+  if(ENABLE_QT)
+    target_compile_definitions(plugin-check PRIVATE CONSTELLATIONS_HAS_QT)
+  endif()
   add_test(
     NAME plugin-check
     COMMAND plugin-check "$<TARGET_FILE:${CMAKE_PROJECT_NAME}>" "${CMAKE_CURRENT_SOURCE_DIR}/data"

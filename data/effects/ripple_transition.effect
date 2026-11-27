@@ -1,0 +1,78 @@
+/*
+ * Constellations - Liquid Ripple transition.
+ *
+ * A drop lands and a ring front runs out from it: the incoming scene fills in
+ * behind the front, and the rings riding on it refract both scenes and catch
+ * a highlight. The ripples are scaled by an envelope that is zero on the first
+ * and last frame, and the front runs from short of the drop to past the
+ * furthest corner, so those frames are the two scenes exactly.
+ */
+
+uniform float4x4 ViewProj;
+uniform texture2d a_tex;
+uniform texture2d b_tex;
+
+uniform float2 canvas;
+uniform float2 centre;     /* px */
+uniform float front;       /* px from the centre */
+uniform float env;         /* ripple strength now, 0 at both ends */
+uniform float wavelength;  /* px */
+uniform float amplitude;   /* px of refraction at the crest */
+uniform float damping;     /* px over which the rings fade either side */
+uniform float soft;        /* px, half width of the front */
+uniform float highlight;
+uniform float4 highlight_color;
+
+#define TAU 6.28318530718
+
+sampler_state textureSampler {
+	Filter   = Linear;
+	AddressU = Clamp;
+	AddressV = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData v_out;
+	v_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	v_out.uv  = v_in.uv;
+	return v_out;
+}
+
+float4 PSRipple(VertData v_in) : TARGET
+{
+	float2 px = v_in.uv * canvas;
+	float2 d = px - centre;
+	float r = length(d);
+	float2 dir = r > 0.001 ? d / r : float2(0.0, 0.0);
+	float x = r - front;
+	float k = TAU / wavelength;
+	float fall = exp(-abs(x) / damping);
+	float wave = sin(k * x) * fall;
+	/* the wave's slope, normalised to -1..1 at the crests */
+	float slope = (cos(k * x) - sign(x) * sin(k * x) / (k * damping)) * fall;
+
+	float2 at = (px - dir * amplitude * env * wave) / canvas;
+	float4 a = a_tex.SampleLevel(textureSampler, at, 0.0);
+	float4 b = b_tex.SampleLevel(textureSampler, at, 0.0);
+	float4 c = lerp(b, a, smoothstep(-soft, soft, x));
+
+	float shine = highlight * env;
+	c.rgb *= 1.0 - 0.3 * shine * saturate(-slope);
+	c.rgb = lerp(c.rgb, highlight_color.rgb, shine * pow(saturate(slope), 6.0));
+	return c;
+}
+
+technique Ripple
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSRipple(v_in);
+	}
+}

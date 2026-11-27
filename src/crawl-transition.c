@@ -1,0 +1,255 @@
+/*
+Constellations - Text Crawl transition
+Copyright (C) 2026 Eion Dailey <Eiondailey@live.com>
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+(at your option) any later version.
+*/
+
+/* The look is in data/effects/crawl_transition.effect. The phrase is laid out
+ * with Qt by Text Tiles' rasterizer, so this is only built with Qt. */
+
+#include <obs-module.h>
+#include <stdio.h>
+#include <string.h>
+#include <util/threading.h>
+
+#include "palette.h"
+#include "text-tiles-raster.h"
+#include "transition-common.h"
+
+struct crawl_info {
+	struct transition_base base;
+
+	gs_eparam_t *ep_a_tex, *ep_b_tex, *ep_text_sdf, *ep_canvas, *ep_progress, *ep_easing, *ep_rows, *ep_bar_w,
+		*ep_stagger, *ep_direction, *ep_has_text, *ep_text_size, *ep_text_rect, *ep_period, *ep_text_scale,
+		*ep_sdf_spread, *ep_bar_color, *ep_text_color;
+
+	pthread_mutex_t mutex;
+	int rows, easing, direction;
+	float bar_w, stagger, fill;
+	uint32_t bar_rgba, text_rgba;
+	char palette[64];
+	struct ctt_glyphs pending, glyphs; /* pending is uploaded on the next frame */
+	bool dirty;
+	gs_texture_t *tex;
+};
+
+static const struct tc_param crawl_params[] = {
+	TC_PARAM(struct crawl_info, ep_a_tex, "a_tex"),
+	TC_PARAM(struct crawl_info, ep_b_tex, "b_tex"),
+	TC_PARAM(struct crawl_info, ep_text_sdf, "text_sdf"),
+	TC_PARAM(struct crawl_info, ep_canvas, "canvas"),
+	TC_PARAM(struct crawl_info, ep_progress, "progress"),
+	TC_PARAM(struct crawl_info, ep_easing, "easing"),
+	TC_PARAM(struct crawl_info, ep_rows, "rows"),
+	TC_PARAM(struct crawl_info, ep_bar_w, "bar_w"),
+	TC_PARAM(struct crawl_info, ep_stagger, "stagger"),
+	TC_PARAM(struct crawl_info, ep_direction, "direction"),
+	TC_PARAM(struct crawl_info, ep_has_text, "has_text"),
+	TC_PARAM(struct crawl_info, ep_text_size, "text_size"),
+	TC_PARAM(struct crawl_info, ep_text_rect, "text_rect"),
+	TC_PARAM(struct crawl_info, ep_period, "period"),
+	TC_PARAM(struct crawl_info, ep_text_scale, "text_scale"),
+	TC_PARAM(struct crawl_info, ep_sdf_spread, "sdf_spread"),
+	TC_PARAM(struct crawl_info, ep_bar_color, "bar_color"),
+	TC_PARAM(struct crawl_info, ep_text_color, "text_color"),
+};
+
+static const char *crawl_get_name(void *type_data)
+{
+	UNUSED_PARAMETER(type_data);
+	return obs_module_text("Crawl.Transition");
+}
+
+static void crawl_update(void *data, obs_data_t *settings)
+{
+	struct crawl_info *c = data;
+	obs_data_t *font = obs_data_get_obj(settings, "font");
+	struct ctt_font f = {
+		.face = obs_data_get_string(font, "face"),
+		.style = obs_data_get_string(font, "style"),
+		.size = (int)obs_data_get_int(font, "size"),
+		.flags = (uint32_t)obs_data_get_int(font, "flags"),
+		.letter_spacing = (float)obs_data_get_double(settings, "letter_spacing"),
+	};
+	struct ctt_glyphs g;
+	ctt_raster_text(&f, obs_data_get_string(settings, "text"), obs_data_get_bool(settings, "uppercase"),
+			CTT_SDF_SPREAD, &g);
+	obs_data_release(font);
+
+	pthread_mutex_lock(&c->mutex);
+	ctt_glyphs_free(&c->pending);
+	c->pending = g;
+	c->dirty = true;
+	c->rows = (int)obs_data_get_int(settings, "rows");
+	c->easing = (int)obs_data_get_int(settings, "easing");
+	c->direction = (int)obs_data_get_int(settings, "direction");
+	c->bar_w = (float)obs_data_get_double(settings, "bar_width") / 100.0f;
+	c->stagger = (float)obs_data_get_double(settings, "stagger") / 100.0f;
+	c->fill = (float)obs_data_get_double(settings, "text_fill") / 100.0f;
+	c->bar_rgba = (uint32_t)obs_data_get_int(settings, "bar_color") | 0xFF000000;
+	c->text_rgba = (uint32_t)obs_data_get_int(settings, "text_color") | 0xFF000000;
+	snprintf(c->palette, sizeof(c->palette), "%s", obs_data_get_string(settings, CPAL_KEY));
+	pthread_mutex_unlock(&c->mutex);
+}
+
+static void *crawl_create(obs_data_t *settings, obs_source_t *source)
+{
+	struct crawl_info *c = bzalloc(sizeof(*c));
+	if (!tc_base_init(&c->base, source, "crawl_transition.effect", crawl_params, TC_COUNT(crawl_params))) {
+		bfree(c);
+		return NULL;
+	}
+	pthread_mutex_init(&c->mutex, NULL);
+	crawl_update(c, settings);
+	return c;
+}
+
+static void crawl_destroy(void *data)
+{
+	struct crawl_info *c = data;
+	obs_enter_graphics();
+	gs_texture_destroy(c->tex);
+	obs_leave_graphics();
+	tc_base_free(&c->base);
+	ctt_glyphs_free(&c->pending);
+	ctt_glyphs_free(&c->glyphs);
+	pthread_mutex_destroy(&c->mutex);
+	bfree(c);
+}
+
+static void crawl_callback(void *data, gs_texture_t *a, gs_texture_t *b, float t, uint32_t cx, uint32_t cy)
+{
+	struct crawl_info *c = data;
+	struct tc_frame frame;
+	struct tc_color bar, text;
+	struct vec2 v;
+	struct vec4 rect;
+	uint32_t pal[CPAL_SLOTS];
+
+	pthread_mutex_lock(&c->mutex);
+	if (c->dirty) {
+		gs_texture_destroy(c->tex);
+		ctt_glyphs_free(&c->glyphs);
+		c->glyphs = c->pending;
+		memset(&c->pending, 0, sizeof(c->pending));
+		const uint8_t *sdf = (const uint8_t *)c->glyphs.sdf;
+		c->tex = sdf ? gs_texture_create(c->glyphs.tex_w, c->glyphs.tex_h, GS_R16, 1, &sdf, 0) : NULL;
+		c->dirty = false;
+	}
+	const struct ctt_glyphs *g = &c->glyphs;
+	float rows = (float)(c->rows < 1 ? 1 : c->rows), row_h = (float)cy / rows;
+	bool has_pal = cpal_get(c->palette, pal);
+	tc_color_from_rgba(&bar, has_pal ? pal[0] | 0xFF000000 : c->bar_rgba);
+	tc_color_from_rgba(&text, has_pal ? pal[1] | 0xFF000000 : c->text_rgba);
+	tc_frame_begin(&frame);
+	tc_set_texture(&frame, c->ep_a_tex, a);
+	tc_set_texture(&frame, c->ep_b_tex, b);
+	gs_effect_set_texture(c->ep_text_sdf, c->tex);
+	tc_set_color(&frame, c->ep_bar_color, &bar);
+	tc_set_color(&frame, c->ep_text_color, &text);
+	vec2_set(&v, (float)cx, (float)cy);
+	gs_effect_set_vec2(c->ep_canvas, &v);
+	gs_effect_set_float(c->ep_progress, t);
+	gs_effect_set_float(c->ep_easing, (float)c->easing);
+	gs_effect_set_float(c->ep_rows, rows);
+	gs_effect_set_float(c->ep_bar_w, c->bar_w * (float)cx);
+	gs_effect_set_float(c->ep_stagger, clampf(c->stagger, 0.0f, 0.9f));
+	gs_effect_set_float(c->ep_direction, (float)c->direction);
+	gs_effect_set_float(c->ep_has_text, c->tex && g->box_h > 0.0f ? 1.0f : 0.0f);
+	vec2_set(&v, g->box_w, g->box_h);
+	gs_effect_set_vec2(c->ep_text_size, &v);
+	vec4_set(&rect, g->tex_x, g->tex_y, g->tex_wpx, g->tex_hpx);
+	gs_effect_set_vec4(c->ep_text_rect, &rect);
+	gs_effect_set_float(c->ep_period, g->box_w + 0.6f * g->box_h + 1.0f);
+	gs_effect_set_float(c->ep_text_scale, g->box_h > 0.0f ? c->fill * row_h / g->box_h : 1.0f);
+	gs_effect_set_float(c->ep_sdf_spread, CTT_SDF_SPREAD);
+	pthread_mutex_unlock(&c->mutex);
+
+	while (gs_effect_loop(c->base.effect, "Crawl"))
+		gs_draw_sprite(NULL, 0, cx, cy);
+	tc_frame_end(&frame);
+}
+
+static void crawl_video_render(void *data, gs_effect_t *effect)
+{
+	UNUSED_PARAMETER(effect);
+	struct crawl_info *c = data;
+	obs_transition_video_render(c->base.source, crawl_callback);
+}
+
+static obs_properties_t *crawl_properties(void *data)
+{
+	UNUSED_PARAMETER(data);
+	obs_properties_t *props = obs_properties_create();
+	obs_property_t *p;
+#define T(k) obs_module_text("Crawl." k)
+#define SLIDER(key, name, lo, hi, step, suffix)                                \
+	p = obs_properties_add_float_slider(props, key, T(name), lo, hi, step); \
+	obs_property_float_set_suffix(p, suffix)
+
+	obs_properties_add_text(props, "text", T("Text"), OBS_TEXT_DEFAULT);
+	obs_properties_add_bool(props, "uppercase", T("Uppercase"));
+	obs_properties_add_font(props, "font", T("Font"));
+	SLIDER("letter_spacing", "LetterSpacing", -50.0, 200.0, 0.5, " px");
+	obs_properties_add_int_slider(props, "rows", T("Rows"), 1, 16, 1);
+	p = obs_properties_add_list(props, "direction", T("Direction"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(p, T("Direction.Right"), 0);
+	obs_property_list_add_int(p, T("Direction.Left"), 1);
+	obs_property_list_add_int(p, T("Direction.Alternate"), 2);
+	p = obs_properties_add_list(props, "easing", obs_module_text("Tiles.Easing"), OBS_COMBO_TYPE_LIST,
+				    OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(p, obs_module_text("Tiles.Easing.Linear"), 0);
+	obs_property_list_add_int(p, obs_module_text("Tiles.Easing.InOut"), 1);
+	obs_property_list_add_int(p, obs_module_text("Tiles.Easing.Out"), 2);
+	SLIDER("stagger", "Stagger", 0.0, 90.0, 1.0, " %");
+	obs_property_set_long_description(p, T("Stagger.Description"));
+	SLIDER("bar_width", "BarWidth", 5.0, 200.0, 1.0, " %");
+	obs_property_set_long_description(p, T("BarWidth.Description"));
+	SLIDER("text_fill", "TextFill", 10.0, 100.0, 1.0, " %");
+	obs_property_set_long_description(p, T("TextFill.Description"));
+	obs_properties_add_color(props, "bar_color", T("BarColor"));
+	obs_properties_add_color(props, "text_color", T("TextColor"));
+	p = cpal_add_list(props);
+	obs_property_set_long_description(p, T("Palette.Description"));
+#undef SLIDER
+#undef T
+	return props;
+}
+
+static void crawl_defaults(obs_data_t *settings)
+{
+	obs_data_set_default_string(settings, "text", "BE RIGHT BACK  \xE2\x98\x85");
+	obs_data_t *font = obs_data_create();
+	obs_data_set_default_string(font, "face", CTT_DEFAULT_FACE);
+	obs_data_set_default_string(font, "style", "Bold");
+	obs_data_set_default_int(font, "size", 96);
+	obs_data_set_default_int(font, "flags", OBS_FONT_BOLD);
+	obs_data_set_default_obj(settings, "font", font);
+	obs_data_release(font);
+	obs_data_set_default_int(settings, "rows", 4);
+	obs_data_set_default_int(settings, "direction", 2);
+	obs_data_set_default_int(settings, "easing", 1);
+	obs_data_set_default_double(settings, "stagger", 30.0);
+	obs_data_set_default_double(settings, "bar_width", 60.0);
+	obs_data_set_default_double(settings, "text_fill", 60.0);
+	obs_data_set_default_int(settings, "bar_color", 0xFF3A1A14); /* #141A3A */
+	obs_data_set_default_int(settings, "text_color", 0xFFFFFFFF);
+}
+
+struct obs_source_info crawl_transition = {
+	.id = "constellations_crawl_transition",
+	.type = OBS_SOURCE_TYPE_TRANSITION,
+	.get_name = crawl_get_name,
+	.create = crawl_create,
+	.destroy = crawl_destroy,
+	.update = crawl_update,
+	.video_render = crawl_video_render,
+	.audio_render = tc_audio_render,
+	.get_properties = crawl_properties,
+	.get_defaults = crawl_defaults,
+	.video_get_color_space = tc_video_get_color_space,
+};
