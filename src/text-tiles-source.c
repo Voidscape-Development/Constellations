@@ -21,6 +21,7 @@ the Free Software Foundation; either version 2 of the License, or
 #include "common.h"
 #include "text-tiles-math.h"
 #include "text-tiles-raster.h"
+#include "palette.h"
 
 /* A phrase repeated along rows that each slide sideways at their own speed.
  *
@@ -119,6 +120,7 @@ struct ctt_config {
 	struct vec4 bg_color, bg_color2; /* sRGB-encoded, straight alpha */
 	float bg_angle_deg;
 	bool has_bg;
+	char palette[64];
 };
 
 /* What the text is rasterized from. */
@@ -159,6 +161,8 @@ struct ctt_source {
 	struct ctt_config pending;
 	bool has_pending;
 	volatile long width, height;
+	uint32_t pal[CPAL_SLOTS];
+	bool has_pal; /* pal holds the live palette this frame */
 	volatile long reset_motion;
 
 	/* Text rasterization. update() queues a request when the text or font
@@ -367,6 +371,7 @@ static void ctt_update(void *data, obs_data_t *settings)
 	c.motion.seed = (uint32_t)obs_data_get_int(settings, "seed");
 	c.stagger = obs_data_get_double(settings, "stagger");
 	c.random_offset = obs_data_get_bool(settings, "random_offset");
+	snprintf(c.palette, sizeof(c.palette), "%s", obs_data_get_string(settings, CPAL_KEY));
 
 	if (!s->is_filter) {
 		c.bg_type = (int)obs_data_get_int(settings, "background_type");
@@ -453,6 +458,7 @@ static void ctt_tick(void *data, float seconds)
 		s->has_pending = false;
 	}
 	pthread_mutex_unlock(&s->mutex);
+	s->has_pal = cpal_get(s->cfg.palette, s->pal);
 
 	if (os_atomic_set_long(&s->reset_motion, 0)) {
 		memset(s->row_pos, 0, sizeof(double) * CTT_ROW_SLOTS);
@@ -563,8 +569,13 @@ static void ctt_draw_background(struct ctt_source *s, uint32_t width, uint32_t h
 		return;
 	double a = (double)c->bg_angle_deg * (M_PI / 180.0);
 	cfx_set_vec2(fx, P_CANVAS_SIZE, (float)width, (float)height);
-	cfx_set_vec4(fx, P_BG_COLOR, &c->bg_color);
-	cfx_set_vec4(fx, P_BG_COLOR2, &c->bg_color2);
+	struct vec4 bg = c->bg_color, bg2 = c->bg_color2;
+	if (s->has_pal) {
+		cpal_apply(s->pal, 0, &bg, false);
+		cpal_apply(s->pal, CPAL_BG_SHADE, &bg2, false);
+	}
+	cfx_set_vec4(fx, P_BG_COLOR, &bg);
+	cfx_set_vec4(fx, P_BG_COLOR2, &bg2);
 	cfx_set_float(fx, P_BG_TYPE, (float)c->bg_type);
 	cfx_set_vec2(fx, P_BG_DIR, (float)cos(a), (float)sin(a));
 	while (gs_effect_loop(fx->effect, "Background"))
@@ -598,8 +609,13 @@ static void ctt_draw_text(struct ctt_source *s, uint32_t width, uint32_t height)
 	cfx_set_float(fx, P_SDF_SPREAD, CTT_SDF_SPREAD);
 	cfx_set_float(fx, P_OUTLINE_PX, c->outline_px);
 	cfx_set_float(fx, P_FILL_MODE, (float)c->fill_mode);
-	cfx_set_vec4(fx, P_TEXT_COLOR, &c->color);
-	cfx_set_vec4(fx, P_TEXT_COLOR2, &c->color2);
+	struct vec4 color = c->color, color2 = c->color2;
+	if (s->has_pal) {
+		cpal_apply(s->pal, 1, &color, false);
+		cpal_apply(s->pal, 2, &color2, false);
+	}
+	cfx_set_vec4(fx, P_TEXT_COLOR, &color);
+	cfx_set_vec4(fx, P_TEXT_COLOR2, &color2);
 	cfx_set_float(fx, P_GRAD_SPAN, (float)c->grad_span);
 	cfx_set_vec2(fx, P_GRAD_DIR, (float)cos(ga), (float)sin(ga));
 	cfx_set_float(fx, P_TONE_AMOUNT, fabsf(c->tone_amount));
@@ -820,6 +836,7 @@ static obs_properties_t *ctt_props_common(void *data, bool is_filter)
 	obs_property_list_add_int(p, T("Fill.Tone"), CTT_FILL_TONE);
 	obs_property_list_add_int(p, T("Fill.Gradient"), CTT_FILL_GRADIENT);
 	obs_property_set_modified_callback(p, ctt_visibility);
+	cpal_add_list(style);
 	obs_properties_add_color(style, "text_color", T("Color"));
 	obs_properties_add_color(style, "text_color2", T("Color2"));
 	p = obs_properties_add_list(style, "gradient_span", T("GradientSpan"), OBS_COMBO_TYPE_LIST,

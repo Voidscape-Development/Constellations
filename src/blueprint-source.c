@@ -16,6 +16,7 @@ the Free Software Foundation; either version 2 of the License, or
 #include "shape-defs.h"
 #include "common.h"
 #include "lattice.h"
+#include "palette.h"
 
 enum {
 	P_CANVAS_SIZE,
@@ -49,6 +50,7 @@ struct cbp_config {
 	float rotation_deg;
 	float grain, vignette;
 	float speed, angle_deg;
+	char palette[64];
 };
 
 struct cbp_source {
@@ -105,6 +107,7 @@ static void cbp_update(void *data, obs_data_t *settings)
 	c.vignette = (float)obs_data_get_double(settings, "vignette");
 	c.speed = (float)obs_data_get_double(settings, "scroll_speed");
 	c.angle_deg = (float)obs_data_get_double(settings, "scroll_angle");
+	snprintf(c.palette, sizeof(c.palette), "%s", obs_data_get_string(settings, CPAL_KEY));
 
 	os_atomic_set_long(&s->width, (long)c.width);
 	os_atomic_set_long(&s->height, (long)c.height);
@@ -168,9 +171,16 @@ static void cbp_tick(void *data, float seconds)
 static void cbp_draw(struct cbp_source *s, uint32_t w, uint32_t h)
 {
 	const struct cfx_effect *fx = &s->fx;
-	const struct cbp_config *c = &s->cfg;
+	struct cbp_config pc = s->cfg;
+	const struct cbp_config *c = &pc;
 	if (!fx->effect || w == 0 || h == 0)
 		return;
+	uint32_t pal[CPAL_SLOTS];
+	if (cpal_get(pc.palette, pal)) {
+		cpal_apply(pal, 0, &pc.bg_color, false);
+		cpal_apply(pal, 1, &pc.minor_color, false);
+		cpal_apply(pal, 2, &pc.major_color, false);
+	}
 	float rot = c->rotation_deg * (float)(M_PI / 180.0);
 	cfx_set_vec2(fx, P_CANVAS_SIZE, (float)w, (float)h);
 	cfx_set_vec2(fx, P_GRID_ROT, cosf(rot), sinf(rot));
@@ -265,6 +275,7 @@ static obs_properties_t *cbp_props_common(bool is_filter)
 	obs_properties_add_group(props, "grid_group", T("Group.Grid"), OBS_GROUP_NORMAL, grid);
 
 	obs_properties_t *paper = obs_properties_create();
+	cpal_add_list(paper);
 	obs_properties_add_color_alpha(paper, "background_color",
 				       obs_module_text("Constellations.Canvas.BackgroundColor"));
 	obs_properties_add_float_slider(paper, "grain", T("Grain"), 0.0, 1.0, 0.01);

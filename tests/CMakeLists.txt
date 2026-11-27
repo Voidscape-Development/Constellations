@@ -52,3 +52,11 @@ add_shader_test(test-mirrors test-mirrors.cpp ../src/matte-math.c ../src/glass-m
 # matte transition its clock and its range, so these link that code directly.
 add_transition_test(test-glass test-glass.c ../src/glass-mesh.c)
 add_transition_test(test-matte test-matte.c ../src/matte-math.c)
+
+# The palette's time-of-day drift and the ink transition's schedule are
+# header-only and need no OBS SDK.
+add_executable(test-palette test-palette.c)
+target_include_directories(test-palette PRIVATE ../src)
+target_compile_options(test-palette PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-Wall -Wextra -Werror>)
+target_link_libraries(test-palette PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:m>)
+add_test(NAME palette COMMAND test-palette)

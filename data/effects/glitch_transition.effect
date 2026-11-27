@@ -1,0 +1,130 @@
+/*
+ * Constellations - Pixel Sort / Glitch transition.
+ *
+ * The scenes swap block by block under a burst of corruption: rows of bright
+ * pixels are smeared out as though sorted, bands of the picture slip
+ * sideways, blocks jump, and the color channels split apart. Every effect is
+ * scaled by an envelope that is zero on the first and last frame, and the
+ * swap threshold runs from 0 to 1, so those frames are the two scenes as
+ * they are.
+ */
+
+uniform float4x4 ViewProj;
+uniform texture2d a_tex;
+uniform texture2d b_tex;
+
+uniform float2 canvas;
+uniform float progress;
+uniform float style;          /* 0 both, 1 pixel sort, 2 digital glitch */
+uniform float intensity;
+uniform float block;          /* px */
+uniform float sort_threshold; /* luma above which pixels are sorted */
+uniform float sort_length;    /* longest smear, share of the canvas */
+uniform float sort_vertical;
+uniform float split;          /* px of channel separation at the peak */
+uniform float tint;
+uniform float4 tint_color;
+uniform float seed;
+
+sampler_state textureSampler {
+	Filter   = Linear;
+	AddressU = Clamp;
+	AddressV = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData v_out;
+	v_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	v_out.uv  = v_in.uv;
+	return v_out;
+}
+
+float hash21(float2 p)
+{
+	float2 h = frac(p * float2(127.1, 311.7));
+	h += dot(h, h + 47.31);
+	return frac(h.x * h.y);
+}
+
+float4 scene(bool b, float2 px)
+{
+	float2 uv = px / canvas;
+	return b ? b_tex.SampleLevel(textureSampler, uv, 0.0) : a_tex.SampleLevel(textureSampler, uv, 0.0);
+}
+
+float luma(float4 c)
+{
+	return dot(c.rgb, float3(0.2126, 0.7152, 0.0722));
+}
+
+float4 PSGlitch(VertData v_in) : TARGET
+{
+	float2 px = v_in.uv * canvas;
+	float e = 4.0 * progress * (1.0 - progress);
+	float env = e * e * (3.0 - 2.0 * e) * intensity;
+	float frame = floor(progress * 18.0) + seed * 0.137;
+	bool glitch = style != 1.0;
+	bool sort = style != 2.0;
+	bool hit = false;
+
+	/* which scene: blocks swap on their own hash as the threshold rises */
+	float swap = smoothstep(0.3, 0.7, progress);
+	bool use_b = hash21(floor(px / (block * 2.0)) + seed) < swap;
+
+	if (glitch && env > 0.0) {
+		/* bands slip sideways */
+		float band = floor(px.y / max(block * 0.5, 1.0));
+		if (hash21(float2(band, frame)) < env * 0.35) {
+			px.x += (hash21(float2(band, frame + 1.0)) - 0.5) * block * 4.0 * env;
+			hit = true;
+		}
+		/* blocks jump, and may show the other scene for a frame */
+		float2 cell = floor(px / block);
+		if (hash21(cell + frame * 1.7) < env * 0.12) {
+			px += (float2(hash21(cell + frame), hash21(cell - frame)) - 0.5) * block * 2.0;
+			use_b = hash21(cell + frame * 3.1) < progress;
+			hit = true;
+		}
+	}
+
+	if (sort && env > 0.0) {
+		float2 dir = sort_vertical > 0.5 ? float2(0.0, 1.0) : float2(1.0, 0.0);
+		float along = dot(px, dir);
+		float line = floor(dot(px, dir.yx) / 2.0);
+		float span = dot(canvas, dir);
+		float len = max(span * sort_length * (0.3 + 0.7 * hash21(float2(line, 1.0 + seed))), 4.0);
+		float phase = hash21(float2(line, 2.0 + seed)) * len;
+		float start = floor((along + phase) / len) * len - phase;
+		float f = (along - start) / len;
+		if (hash21(float2(line, 3.0 + seed)) < 0.35 + 0.65 * saturate(env)) {
+			float2 at = px + dir * (start + len * pow(f, 1.0 + 6.0 * env) - along);
+			if (luma(scene(use_b, at)) > sort_threshold)
+				px = at;
+		}
+	}
+
+	float2 off = float2(split * env, 0.0);
+	float4 c = scene(use_b, px);
+	if (split > 0.0 && env > 0.0) {
+		c.r = scene(use_b, px + off).r;
+		c.b = scene(use_b, px - off).b;
+	}
+	if (hit)
+		c.rgb = lerp(c.rgb, tint_color.rgb, tint * saturate(env));
+	return c;
+}
+
+technique Glitch
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSGlitch(v_in);
+	}
+}

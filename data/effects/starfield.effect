@@ -1,0 +1,71 @@
+// Constellations - Starfield / Warp
+// (c) 2026 Eion Dailey - GPLv2+
+//
+// Stars fly out of a vanishing point. Worked in polar coordinates round that
+// point: each layer cuts the full turn into angular bins holding one star
+// each, at its own radius and depth, so a star is found with one lookup per
+// layer, and at warp its streak runs along the radius for any length without
+// leaving its bin.
+
+#include "gen_common.effect"
+
+uniform float density;    // angular bins in the first layer
+uniform float star_size;  // px, for a star at the near plane
+uniform float warp;       // streak length, 0 = points
+uniform float twinkle;
+uniform float color_mix;  // 0 white stars, 1 palette colors
+uniform float brightness;
+uniform float centre_x;   // vanishing point, % of the canvas
+uniform float centre_y;
+
+#define LAYERS 6.0
+
+float4 PSStars(VertData v_in) : TARGET
+{
+	float2 d = v_in.uv * canvas_size - float2(centre_x, centre_y) * 0.01 * canvas_size;
+	float r_p = length(d);
+	float ang = atan2(d.y, d.x) / TAU + 0.5;
+	float r_ref = 0.15 * max(canvas_size.x, canvas_size.y);
+	float3 acc = float3(0.0, 0.0, 0.0);
+
+	for (float L = 0.0; L < LAYERS; L += 1.0) {
+		float bins = floor(max(density, 8.0) * (0.6 + 0.25 * L));
+		float u = ang * bins;
+		float bin = floor(u);
+		float2 id = float2(bin, L * 17.0 + 3.0);
+		float h1 = hash21(id), h2 = hash21(id + 5.3), h3 = hash21(id + 11.9), h4 = hash21(id + 23.1);
+
+		float z = 1.0 - frac(h1 + time * (0.06 + 0.05 * h2));
+		z = max(z, 0.002);
+		float rho = (0.08 + 0.92 * h3) * r_ref;
+		float r_s = rho / z;
+		float r_t = rho / min(z + warp * 0.35, 1.0);
+
+		float da = (u - bin - 0.5 - (h4 - 0.5) * 0.5) / bins * TAU;
+		float perp = r_p * abs(da);
+		float along = r_p > r_s ? r_p - r_s : (r_p < r_t ? r_t - r_p : 0.0);
+		float size = max(star_size, 0.3) * (0.35 + 1.65 * (1.0 - z));
+		float dist = length(float2(perp, along));
+		float cov = saturate(1.0 - dist / size);
+		cov *= cov;
+
+		float tail_w = r_s > r_t ? lerp(0.25, 1.0, saturate((r_p - r_t) / (r_s - r_t))) : 1.0;
+		float fade_in = smoothstep(1.0, 0.8, z);
+		float tw = 1.0 - twinkle * (0.5 + 0.5 * sin(clock * (2.0 + 3.0 * h4) + h1 * TAU));
+		float3 tint = lerp(float3(1.0, 1.0, 1.0), palette_pick(floor(h2 * 5.0)), color_mix);
+
+		acc += tint * cov * tail_w * fade_in * tw * brightness;
+	}
+
+	float a = saturate(max(acc.r, max(acc.g, acc.b)));
+	return over_bg(acc / max(a, 0.0001), a);
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSStars(v_in);
+	}
+}

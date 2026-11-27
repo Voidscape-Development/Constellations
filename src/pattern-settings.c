@@ -10,6 +10,7 @@ the Free Software Foundation; either version 2 of the License, or
 
 #include "pattern-internal.h"
 #include "common.h"
+#include "palette.h"
 
 #include <plugin-support.h>
 
@@ -563,6 +564,8 @@ void cpat_renderer_add_properties(struct cpat_renderer *r, obs_properties_t *pro
 		obs_properties_add_float_slider(props, "canvas_rotation",
 						obs_module_text("Constellations.Canvas.Rotation"), 0.0, 360.0, 1.0);
 	}
+
+	cpal_add_list(props);
 
 	obs_property_t *p = obs_properties_add_int_slider(props, "item_count",
 							  obs_module_text("Constellations.ItemCount"), 1, MAX_ITEMS, 1);

@@ -12,6 +12,7 @@ the Free Software Foundation; either version 2 of the License, or
 #include "pattern-media.h"
 #include "common.h"
 #include "lattice.h"
+#include "palette.h"
 
 #include <plugin-support.h>
 #include <util/dstr.h>
@@ -228,6 +229,7 @@ struct cpat_config {
 	uint32_t width, height;
 	int background_type;
 	struct vec4 background_color, background_color2; /* sRGB-encoded */
+	char palette[64];
 	float background_angle_deg;
 	bool has_background;
 	float anchor_x_pct, anchor_y_pct;
@@ -313,6 +315,8 @@ struct cpat_renderer {
 	double border_march;
 	double wander_time;
 	uint64_t overdraw_warned;
+	uint32_t pal[CPAL_SLOTS];
+	bool has_pal; /* pal holds the live palette this frame */
 };
 
 /* ------------------------------------------------------------ settings */
@@ -486,6 +490,7 @@ static void read_config(struct cpat_renderer *r, struct cpat_config *cfg, obs_da
 	vec4_from_rgba(&cfg->background_color, (uint32_t)obs_data_get_int(settings, "background_color"));
 	vec4_from_rgba(&cfg->background_color2, (uint32_t)obs_data_get_int(settings, "background_color2"));
 	cfg->background_angle_deg = (float)obs_data_get_double(settings, "background_angle");
+	snprintf(cfg->palette, sizeof(cfg->palette), "%s", obs_data_get_string(settings, CPAL_KEY));
 	cfg->has_background = cfg->background_type != CBG_NONE &&
 			      (cfg->background_color.w > 0.0001f ||
 			       (cfg->background_type != CBG_SOLID && cfg->background_color2.w > 0.0001f));
@@ -757,6 +762,7 @@ void cpat_renderer_tick(struct cpat_renderer *r, float seconds)
 	cfg = r->cfg;
 	if (!cfg)
 		return;
+	r->has_pal = cpal_get(cfg->palette, r->pal);
 
 	if (os_atomic_set_long(&r->reset_motion, 0)) {
 		r->motion_along = r->motion_perp = 0.0;
@@ -838,8 +844,13 @@ void cpat_renderer_render_background(struct cpat_renderer *r, uint32_t w, uint32
 	const struct cfx_effect *fx = &r->fx;
 	set_mask_uniforms(r, cfg, w, h);
 	float ang = cfg->background_angle_deg * (float)(M_PI / 180.0);
-	cfx_set_vec4(fx, P_BG_COLOR, &cfg->background_color);
-	cfx_set_vec4(fx, P_BG_COLOR2, &cfg->background_color2);
+	struct vec4 bg = cfg->background_color, bg2 = cfg->background_color2;
+	if (r->has_pal) {
+		cpal_apply(r->pal, 0, &bg, false);
+		cpal_apply(r->pal, CPAL_BG_SHADE, &bg2, false);
+	}
+	cfx_set_vec4(fx, P_BG_COLOR, &bg);
+	cfx_set_vec4(fx, P_BG_COLOR2, &bg2);
 	cfx_set_float(fx, P_BG_TYPE, (float)cfg->background_type);
 	cfx_set_vec2(fx, P_BG_DIR, cosf(ang), sinf(ang));
 
@@ -1003,15 +1014,21 @@ static void set_item_uniforms(struct cpat_renderer *r, const struct cpat_config 
 	/* Shapes use their own color. Images and sources pass the tint color
 	 * with the opacity as alpha; the shader applies the tint per
 	 * image_color_mode. */
-	struct vec4 color = it->color;
+	struct vec4 color = it->color, color_b = it->color_b, color_c = it->color_c;
 	if (it->kind != CITEM_SHAPE) {
 		color = it->image_tint;
 		color.w = it->image_opacity;
 	}
+	/* A palette deals its five colors out across the items in turn. */
+	if (r->has_pal) {
+		cpal_apply(r->pal, 1 + i % 5, &color, true);
+		cpal_apply(r->pal, 1 + (i + 1) % 5, &color_b, true);
+		cpal_apply(r->pal, 1 + (i + 2) % 5, &color_c, true);
+	}
 	cfx_set_vec4(fx, P_SHAPE_COLOR, &color);
 	cfx_set_float(fx, P_COLOR_VARIATION, it->random_colors ? 1.0f : 0.0f);
-	cfx_set_vec4(fx, P_COLOR_B, &it->color_b);
-	cfx_set_vec4(fx, P_COLOR_C, &it->color_c);
+	cfx_set_vec4(fx, P_COLOR_B, &color_b);
+	cfx_set_vec4(fx, P_COLOR_C, &color_c);
 	cfx_set_float(fx, P_IMAGE_COLOR_MODE, it->kind == CITEM_SHAPE ? 0.0f : (float)it->image_color_mode);
 }
 
