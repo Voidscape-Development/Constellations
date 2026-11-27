@@ -328,6 +328,43 @@ across is not all rim. The first frame has no portal at all, and on the last it
 has grown past the furthest corner by more than anything the edge reaches in, so
 both ends are exactly one scene.
 
+## Ink Bleed Transition
+
+Ink spreads from one or more drops, its front torn into tendrils by noise. The
+wet edge is darker and stains the outgoing scene just ahead of it, and the
+incoming scene shows through behind the ink.
+
+| Setting | What it does |
+| --- | --- |
+| **Drops** / **First Drop X/Y** / **Seed** | How many drops, where the first one lands (−50% to 150%), and the seed that places the rest and tears the tendrils. |
+| **Flood** | The ink floods the whole canvas first, then the incoming scene bleeds back through it. |
+| **Easing** | How the front moves over the transition. |
+| **Roughness** / **Tendril Scale** | How far the front is torn, and the size of the tendrils. |
+| **Ink Edge** / **Wet Edge** | The width of the band of ink, and how dark its front is and how strongly it stains ahead. |
+| **Ink Color** / **Palette** | The ink, or a palette's Color 1. |
+
+The drops all spread at the same speed. The plugin bounds how far any pixel can
+be from its nearest drop (`src/ink-math.h`, unit tested), and the front runs
+from short of the closest pixel, halo included, to past the furthest one. That
+keeps the first and last frames exactly one scene.
+
+## Pixel Sort / Glitch Transition
+
+The scenes swap block by block under a burst of corruption that peaks halfway
+through.
+
+| Setting | What it does |
+| --- | --- |
+| **Style** | Pixel sort, digital glitch, or both. |
+| **Intensity** / **Block Size** | How strong the burst is, and the size of the blocks that swap, jump and slip. |
+| **Sort Direction** / **Sort Threshold** / **Sort Length** | Rows (or columns) of pixels brighter than the threshold smear out as though sorted, up to this share of the canvas. |
+| **Channel Split** | How far the red and blue channels separate at the peak. |
+| **Glitch Tint** / **Tint Color** / **Palette** | A flash of color over the displaced blocks, taken from a palette's Color 1 if one is chosen. |
+| **Seed** | Which glitch you get. |
+
+The envelope that scales every effect is zero on the first and last frame, and
+the swap threshold runs from 0 to 1, so both ends are exactly one scene.
+
 ## How the transitions are tested
 
 CI runs every suite below on each pull request: the CPU tests directly, and the GPU checks on a software rasteriser

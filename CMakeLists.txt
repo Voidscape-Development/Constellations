@@ -52,6 +52,10 @@ target_sources(
     src/pattern-filter.c
     src/pattern-border.c
     src/blueprint-source.c
+    src/palette.c
+    src/gen-source.c
+    src/generators.c
+    src/mosaic-filter.c
     src/text-tiles-math.c
     src/nanosvg-impl.c
     src/transition-common.c
@@ -66,6 +70,8 @@ target_sources(
     src/matte-transition.c
     src/portal-math.c
     src/portal-transition.c
+    src/ink-transition.c
+    src/glitch-transition.c
 )
 
 # Text Tiles lays its text out with Qt, so it is only built with Qt enabled

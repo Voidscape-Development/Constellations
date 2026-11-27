@@ -1,0 +1,103 @@
+// Constellations - Flow Field
+// (c) 2026 Eion Dailey - GPLv2+
+//
+// Particles drift along the streamlines of a noise field, trailing light.
+// Nothing is stored between frames: each pixel traces its streamline back
+// upstream, and wherever the trace passes a particle's birth point it asks
+// how far down the streamline that particle has travelled by now. A pixel
+// just behind the head lights up, so every particle is a comet moving along
+// the flow, born and fading out on its own cycle.
+
+#include "gen_common.effect"
+
+uniform float field_scale; // px per noise cell
+uniform float turbulence;  // weight of the fine detail in the field
+uniform float spacing;     // px between particle birth points
+uniform float density;     // share of birth points with a particle
+uniform float trail;       // px a particle travels in its life
+uniform float tail;        // share of the trail its tail covers
+uniform float thickness;   // px
+uniform float glow;
+uniform float evolve;      // how fast the field itself changes
+uniform float color_mode;  // 0 by direction, 1 by position, 2 per particle
+
+#define STEPS 32.0
+
+float potential(float2 q)
+{
+	float2 t = float2(time * evolve * 0.05, time * evolve * 0.03);
+	return vnoise(q + t) + turbulence * 0.5 * vnoise(q * 2.3 + float2(13.7, 5.1) - t);
+}
+
+// The curl of a noise potential: divergence free, so streamlines never pile
+// into sinks or fan out of sources, and the particles spread evenly.
+float flow_angle(float2 x)
+{
+	float2 q = x / max(field_scale, 1.0);
+	float e = 0.02;
+	float dx = potential(q + float2(e, 0.0)) - potential(q - float2(e, 0.0));
+	float dy = potential(q + float2(0.0, e)) - potential(q - float2(0.0, e));
+	return atan2(-dx, dy);
+}
+
+float seg_dist(float2 p, float2 a, float2 b)
+{
+	float2 ab = b - a;
+	float t = saturate(dot(p - a, ab) / max(dot(ab, ab), 0.0001));
+	return length(p - a - ab * t);
+}
+
+float4 PSFlow(VertData v_in) : TARGET
+{
+	float2 p = v_in.uv * canvas_size;
+	float step_len = max(trail, 1.0) / STEPS;
+	float tail_steps = max(tail * STEPS, 1.0);
+	float half_w = max(thickness, 0.25) * 0.5;
+	float reach = half_w + glow * thickness * 1.5 + 1.0;
+	float best = 0.0;
+	float3 col = float3(0.0, 0.0, 0.0);
+	float2 x = p;
+
+	for (float k = 1.0; k <= STEPS; k += 1.0) {
+		float2 prev = x;
+		float a = flow_angle(x);
+		x -= float2(cos(a), sin(a)) * step_len;
+
+		float2 cell = floor(x / spacing);
+		if (hash21(cell + 0.37) < density) {
+			float2 c = (cell + 0.5 + (hash22(cell + 7.1) - 0.5) * 0.6) * spacing;
+			float d = seg_dist(c, prev, x);
+			if (d < reach) {
+				float h = hash21(cell + 3.3);
+				float life = frac(h + time * (0.18 + 0.12 * hash21(cell + 9.4)));
+				float behind = life * STEPS - k;
+				if (behind >= 0.0 && behind < tail_steps) {
+					float core = saturate(half_w + 0.5 - d);
+					float halo = glow * exp(-d / max(thickness * 0.75, 0.5));
+					float fade = 1.0 - behind / tail_steps;
+					float b = saturate(core + halo) * fade * fade * sin(PI * life);
+					if (b > best) {
+						best = b;
+						if (color_mode < 0.5)
+							col = palette_at(flow_angle(c) / TAU + 0.5);
+						else if (color_mode < 1.5)
+							col = palette_at(fbm(c / (field_scale * 3.0)) * 2.0);
+						else
+							col = palette_pick(floor(h * 5.0));
+					}
+				}
+			}
+		}
+	}
+
+	return over_bg(col, saturate(best));
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSFlow(v_in);
+	}
+}

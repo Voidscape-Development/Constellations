@@ -1,0 +1,94 @@
+// Constellations - what every generated background shares (see src/gen-source.c)
+// (c) 2026 Eion Dailey - GPLv2+
+
+uniform float4x4 ViewProj;
+
+uniform float2 canvas_size;
+uniform float time;      // seconds scaled by the Speed setting
+uniform float clock;     // wall seconds
+uniform float4 bg_color; // linear light, straight alpha, like every color here
+uniform float4 color1;
+uniform float4 color2;
+uniform float4 color3;
+uniform float4 color4;
+uniform float4 color5;
+
+#define TAU 6.2831853
+#define PI  3.1415927
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData v_out;
+	v_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	v_out.uv  = v_in.uv;
+	return v_out;
+}
+
+float hash21(float2 p)
+{
+	float2 h = frac(p * float2(127.1, 311.7));
+	h += dot(h, h + 47.31);
+	return frac(h.x * h.y);
+}
+
+float2 hash22(float2 p)
+{
+	return float2(hash21(p), hash21(p + 19.73));
+}
+
+float vnoise(float2 p)
+{
+	float2 i = floor(p);
+	float2 f = p - i;
+	f = f * f * (3.0 - 2.0 * f);
+	float a = hash21(i);
+	float b = hash21(i + float2(1.0, 0.0));
+	float c = hash21(i + float2(0.0, 1.0));
+	float d = hash21(i + float2(1.0, 1.0));
+	return lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
+}
+
+float fbm(float2 p)
+{
+	float v = 0.5 * vnoise(p);
+	v += 0.25 * vnoise(p * 2.03 + 17.1);
+	v += 0.125 * vnoise(p * 4.01 + 41.7);
+	return v / 0.875;
+}
+
+// One of the five colors, 0..4.
+float3 palette_pick(float i)
+{
+	if (i < 0.5)
+		return color1.rgb;
+	if (i < 1.5)
+		return color2.rgb;
+	if (i < 2.5)
+		return color3.rgb;
+	if (i < 3.5)
+		return color4.rgb;
+	return color5.rgb;
+}
+
+// The five colors as a loop: 0 and 1 are both color1.
+float3 palette_at(float t)
+{
+	float x = frac(t) * 5.0;
+	float i = floor(x);
+	float f = x - i;
+	f = f * f * (3.0 - 2.0 * f);
+	return lerp(palette_pick(i), palette_pick(i + 1.0 - 5.0 * step(4.5, i + 1.0)), f);
+}
+
+// Straight color over the background, out as premultiplied linear.
+float4 over_bg(float3 rgb, float a)
+{
+	float out_a = a + bg_color.a * (1.0 - a);
+	float3 premul = rgb * a + bg_color.rgb * bg_color.a * (1.0 - a);
+	return float4(premul, out_a);
+}

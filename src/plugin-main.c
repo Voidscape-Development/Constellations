@@ -26,6 +26,11 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "portal-transition.h"
 #include "tiles-transition.h"
 #include "vortex-transition.h"
+#include "palette.h"
+#include "gen-source.h"
+
+extern struct obs_source_info ink_transition;
+extern struct obs_source_info glitch_transition;
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
@@ -44,10 +49,13 @@ bool obs_module_load(void)
 {
 	obs_log(LOG_INFO, "Constellations loading (version %s)", PLUGIN_VERSION);
 	cpat_media_init();
+	constellations_register_palette();
 	constellations_register_pattern_source();
 	constellations_register_blueprint();
 	constellations_register_pattern_filter();
 	constellations_register_pattern_border();
+	constellations_register_generators();
+	constellations_register_mosaic();
 #ifdef CONSTELLATIONS_HAS_QT
 	constellations_register_text_tiles();
 #endif
@@ -56,6 +64,8 @@ bool obs_module_load(void)
 	obs_register_source(&glass_transition);
 	obs_register_source(&matte_transition);
 	obs_register_source(&portal_transition);
+	obs_register_source(&ink_transition);
+	obs_register_source(&glitch_transition);
 	obs_log(LOG_INFO, "Constellations loaded");
 	return true;
 }

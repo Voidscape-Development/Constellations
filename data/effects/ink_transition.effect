@@ -1,0 +1,128 @@
+/*
+ * Constellations - Ink Bleed transition.
+ *
+ * Ink spreads from one or more drops, its front torn up by noise into
+ * tendrils, darker at the wet edge, staining the outgoing scene just ahead
+ * of it and giving way to the incoming scene behind. With flood on, the ink
+ * first covers the canvas, then the incoming scene bleeds back through it.
+ *
+ * The front and the field's scale come from src/ink-math.h, which is what
+ * makes the first and last frames exact.
+ */
+
+uniform float4x4 ViewProj;
+uniform texture2d a_tex;
+uniform texture2d b_tex;
+
+uniform float2 canvas;
+uniform float4 drops01; /* drop positions in px, two per vector */
+uniform float4 drops23;
+uniform float4 drops45;
+uniform float4 drops67;
+uniform float drop_count;
+uniform float scale;      /* 1 / reach: pixel distance to field units */
+uniform float2 noise_offset;
+uniform float tendril_px;
+uniform float roughness;
+uniform float front;      /* field units */
+uniform float edge;       /* field units */
+uniform float aa;         /* field units */
+uniform float stage;      /* 0 reveal, 1 flood in, 2 flood out */
+uniform float wet;
+uniform float4 ink_color;
+
+sampler_state textureSampler {
+	Filter   = Linear;
+	AddressU = Clamp;
+	AddressV = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData v_out;
+	v_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	v_out.uv  = v_in.uv;
+	return v_out;
+}
+
+float hash21(float2 p)
+{
+	float2 h = frac(p * float2(127.1, 311.7));
+	h += dot(h, h + 47.31);
+	return frac(h.x * h.y);
+}
+
+float vnoise(float2 p)
+{
+	float2 i = floor(p);
+	float2 f = p - i;
+	f = f * f * (3.0 - 2.0 * f);
+	return lerp(lerp(hash21(i), hash21(i + float2(1.0, 0.0)), f.x),
+		    lerp(hash21(i + float2(0.0, 1.0)), hash21(i + float2(1.0, 1.0)), f.x), f.y);
+}
+
+/* -1..1 */
+float tendrils(float2 px)
+{
+	float2 q = px / max(tendril_px, 1.0) + noise_offset;
+	float n = 0.5 * vnoise(q) + 0.25 * vnoise(q * 2.1 + 5.3) + 0.15 * vnoise(q * 4.3 + 1.7) + 0.1 * vnoise(q * 9.1);
+	return n * 2.0 - 1.0;
+}
+
+float near_drop(float2 px, float2 d, float k, float best)
+{
+	return drop_count > k ? min(best, length(px - d)) : best;
+}
+
+float field(float2 px)
+{
+	float d = length(px - drops01.xy);
+	d = near_drop(px, drops01.zw, 1.0, d);
+	d = near_drop(px, drops23.xy, 2.0, d);
+	d = near_drop(px, drops23.zw, 3.0, d);
+	d = near_drop(px, drops45.xy, 4.0, d);
+	d = near_drop(px, drops45.zw, 5.0, d);
+	d = near_drop(px, drops67.xy, 6.0, d);
+	d = near_drop(px, drops67.zw, 7.0, d);
+	return d * scale + roughness * 0.25 * tendrils(px);
+}
+
+/* x is how far behind the front, in edges: > 0 behind, < 0 ahead. */
+float4 shade(float x, float4 behind, float4 ahead)
+{
+	float aa_e = aa / max(edge, 0.0001);
+	float3 band = ink_color.rgb * (1.0 - wet * 0.55 * exp(-max(x, 0.0) * 5.0));
+	float4 inner = lerp(float4(band, 1.0), behind, smoothstep(0.55, 1.0, x));
+	float halo = saturate(1.0 + x);
+	float4 outer = float4(lerp(ahead.rgb, ahead.rgb * ink_color.rgb, 0.45 * wet * halo * halo), ahead.a);
+	return lerp(outer, inner, smoothstep(-aa_e, aa_e, x));
+}
+
+float4 PSInk(VertData v_in) : TARGET
+{
+	float2 uv = v_in.uv;
+	float x = (front - field(uv * canvas)) / max(edge, 0.0001);
+	float4 a = a_tex.SampleLevel(textureSampler, uv, 0.0);
+	float4 b = b_tex.SampleLevel(textureSampler, uv, 0.0);
+	float4 ink = float4(ink_color.rgb, 1.0);
+
+	if (stage < 0.5)
+		return shade(x, b, a);
+	if (stage < 1.5)
+		return shade(x, ink, a);
+	return shade(x, b, ink);
+}
+
+technique Ink
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSInk(v_in);
+	}
+}

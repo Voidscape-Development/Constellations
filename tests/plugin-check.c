@@ -340,6 +340,103 @@ static void check_presets(const struct preset_case *pc)
 
 /* A 64x64 BMP: a white square on black, which as a silhouette is a square and
  * as a luma wipe changes the middle last. */
+/* Ink with flood on passes through solid ink at the midpoint. */
+static void check_ink_flood(void)
+{
+	obs_data_t *settings = obs_data_create();
+	obs_source_t *transition;
+
+	obs_data_set_bool(settings, "flood", true);
+	obs_data_set_int(settings, "drops", 5);
+	transition = make_transition("constellations_ink_transition", settings);
+	obs_data_release(settings);
+	if (!transition)
+		return;
+	check_ends(transition, "ink with flood");
+	begin(transition);
+	render_at(transition, 0.5f);
+	check(share_of(255, 0, 0) + share_of(0, 0, 255) < 0.01, "ink with flood: the midpoint is not all ink");
+	obs_transition_set(transition, scene_a);
+	obs_source_release(transition);
+}
+
+/* Renders a source on its own and reads back the frame. */
+static void render_source(obs_source_t *source)
+{
+	uint8_t *data;
+	uint32_t linesize;
+
+	wait_for_tick();
+	obs_enter_graphics();
+	gs_texrender_reset(texrender);
+	if (gs_texrender_begin_with_color_space(texrender, CW, CH, GS_CS_SRGB)) {
+		struct vec4 clear;
+
+		vec4_zero(&clear);
+		gs_clear(GS_CLEAR_COLOR, &clear, 0.0f, 0);
+		gs_ortho(0.0f, (float)CW, 0.0f, (float)CH, -100.0f, 100.0f);
+		obs_source_video_render(source);
+		gs_texrender_end(texrender);
+	}
+	gs_stage_texture(stage, gs_texrender_get_texture(texrender));
+	if (gs_stagesurface_map(stage, &data, &linesize)) {
+		for (int y = 0; y < CH; y++)
+			memcpy(out[y], data + (size_t)y * linesize, CW * 4);
+		gs_stagesurface_unmap(stage);
+	}
+	obs_leave_graphics();
+}
+
+/*
+ * A starfield takes its background from a palette, and the palette drifts
+ * from its day set to its night set by the hour it is previewed at. The
+ * stars are sparse, so the background is most of the frame.
+ */
+static void check_palette(void)
+{
+	obs_data_t *ps = obs_data_create(), *ss = obs_data_create();
+	obs_source_t *palette, *stars;
+
+	obs_data_set_int(ps, "day_0", 0xFF00FF00);
+	obs_data_set_bool(ps, "drift", true);
+	obs_data_set_int(ps, "night_mode", 1);
+	obs_data_set_int(ps, "night_0", 0xFFFF0000);
+	obs_data_set_double(ps, "sunrise", 7.0);
+	obs_data_set_double(ps, "sunset", 19.0);
+	obs_data_set_double(ps, "preview_hour", 12.0);
+	palette = obs_source_create("constellations_palette", "check palette", ps, NULL);
+	check(palette != NULL, "palette: could not be created");
+
+	obs_data_set_int(ss, "width", CW);
+	obs_data_set_int(ss, "height", CH);
+	obs_data_set_double(ss, "density", 40.0);
+	obs_data_set_string(ss, "palette", palette ? obs_source_get_uuid(palette) : "");
+	stars = obs_source_create("constellations_starfield_source", "check stars", ss, NULL);
+	check(stars && obs_obj_get_data(stars), "starfield: could not be created");
+
+	if (palette && stars) {
+		render_source(stars);
+		check(share_of(0, 255, 0) > 0.9, "palette: noon background is only %.4f day color",
+		      share_of(0, 255, 0));
+
+		obs_data_set_double(ps, "preview_hour", 0.0);
+		obs_source_update(palette, ps);
+		render_source(stars);
+		check(share_of(0, 0, 255) > 0.9, "palette: midnight background is only %.4f night color",
+		      share_of(0, 0, 255));
+
+		obs_data_set_string(ss, "palette", "");
+		obs_source_update(stars, ss);
+		render_source(stars);
+		check(share_of(0, 0, 255) + share_of(0, 255, 0) < 0.01, "palette: still applied after being cleared");
+	}
+
+	obs_source_release(stars);
+	obs_source_release(palette);
+	obs_data_release(ss);
+	obs_data_release(ps);
+}
+
 static bool write_mask(const char *path)
 {
 	enum { N = 64 };
@@ -448,8 +545,9 @@ static void check_matte_images(const char *mask_path)
 int main(int argc, char **argv)
 {
 	static const char *ids[] = {
-		"voidscape_tiles_transition", "voidscape_vortex_transition", "voidscape_glass_transition",
-		"voidscape_matte_transition", "voidscape_portal_transition",
+		"voidscape_tiles_transition",       "voidscape_vortex_transition", "voidscape_glass_transition",
+		"voidscape_matte_transition",       "voidscape_portal_transition", "constellations_ink_transition",
+		"constellations_glitch_transition",
 	};
 	static const struct preset_case presets[] = {
 		{"voidscape_glass_transition", "gravity"},
@@ -509,6 +607,9 @@ int main(int argc, char **argv)
 
 	for (size_t i = 0; i < sizeof(presets) / sizeof(presets[0]); i++)
 		check_presets(&presets[i]);
+
+	check_ink_flood();
+	check_palette();
 
 	if (write_mask(mask_path))
 		check_matte_images(mask_path);

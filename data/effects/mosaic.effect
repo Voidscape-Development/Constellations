@@ -1,0 +1,101 @@
+// Constellations - Tile Mosaic filter
+// (c) 2026 Eion Dailey - GPLv2+
+//
+// The source redrawn as flat tiles on the tiling transition's lattices: each
+// tile takes the color at its centre (or the mean of five taps across it),
+// with grout between tiles, a bevel darkening towards the tile edge and a
+// per-tile brightness jitter.
+
+uniform float4x4 ViewProj;
+uniform texture2d image;
+
+uniform float2 canvas_size;
+uniform float grout;        // metric units: 0 none, 1 the whole tile
+uniform float4 grout_color; // premultiplied linear
+uniform float bevel;
+uniform float sample_mode;  // 0 centre, 1 average
+uniform float mix_amount;
+
+// What tiles_math.effect reads. Only the lattice is used here; the sweep
+// uniforms are declared so its sweep and clock functions compile.
+uniform float2 origin_px;
+uniform float2 grid_rot;
+uniform float2 dir_vec;
+uniform float2 dir_range;
+uniform float4 color_a;
+uniform float4 color_b;
+uniform float progress;
+uniform float tile_px;
+uniform float edge;
+uniform float tile_dur;
+uniform float band;
+uniform float randomness;
+uniform float variation;
+uniform int easing;
+uniform int mode;
+uniform int shape;
+uniform int direction;
+uniform bool invert;
+uniform bool reverse_exit;
+
+sampler_state textureSampler {
+	Filter   = Linear;
+	AddressU = Clamp;
+	AddressV = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData v_out;
+	v_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	v_out.uv  = v_in.uv;
+	return v_out;
+}
+
+#include "tiles_math.effect"
+
+float4 tap(float2 px)
+{
+	return image.Sample(textureSampler, px / canvas_size);
+}
+
+float4 PSMosaic(VertData v_in) : TARGET
+{
+	float2 px = v_in.uv * canvas_size;
+	Cell cell = resolve_tile(to_lattice(px));
+	float2 c = from_lattice(cell.centre);
+	float4 col = tap(c);
+
+	if (sample_mode > 0.5) {
+		float r = tile_px * 0.22 * cell.size;
+		col = (col + tap(c + float2(r, r)) + tap(c + float2(-r, r)) + tap(c + float2(r, -r)) +
+		       tap(c + float2(-r, -r))) * 0.2;
+	}
+
+	col.rgb *= 1.0 + (hash21(cell.centre * 7.31 + 0.5) - 0.5) * variation;
+	col.rgb *= 1.0 - bevel * pow(saturate(cell.metric), 6.0);
+
+	// aa is how much faster this cell's metric climbs than a plain tile's, so
+	// scaling by it keeps the grout and its ramp the same width in pixels
+	float aa = edge * cell.aa;
+	float g = grout * cell.aa;
+	// circles leave gaps (metric past 1) that are grout even with none set
+	if (grout > 0.0 || cell.metric > 1.0)
+		col = lerp(col, grout_color, smoothstep(1.0 - g - aa, 1.0 - g + aa * 0.5, cell.metric));
+
+	return lerp(image.Sample(textureSampler, v_in.uv), col, mix_amount);
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSMosaic(v_in);
+	}
+}

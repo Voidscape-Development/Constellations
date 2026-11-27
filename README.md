@@ -16,6 +16,13 @@ Animated pattern backgrounds, borders, overlays and scene transitions for [OBS S
 | **Glass Transition** | Transition | The outgoing scene cracks from a point of impact, holds a beat, and the shards fall away. |
 | **Matte Cutout Transition** | Transition | One big shape cuts the outgoing scene away, with optional border, echo bands and glow for a stinger look. |
 | **Portal Transition** | Transition | A portal is shot open with the incoming scene showing through it, then grows to swallow the canvas. |
+| **Constellations Palette** | Source | A shared background and five colors that other sources and transitions can follow. It can drift to a night set with the local clock. |
+| **Flow Field Background** | Source and filter | Glowing particles stream along the curls of a slowly changing noise field. |
+| **Starfield Background** | Source and filter | Stars fly out of a vanishing point; raise Warp Streaks for hyperspace. |
+| **Aurora Background** | Source and filter | A soft drifting mesh gradient of the five colors, or aurora curtains over a night sky. |
+| **Tile Mosaic** | Filter | Redraws a source as flat tiles on any of the tiling transition's lattices, with grout and bevel. |
+| **Ink Bleed Transition** | Transition | Ink spreads from one or more drops with wet tendril edges, optionally flooding the canvas first. |
+| **Pixel Sort / Glitch Transition** | Transition | The scenes swap block by block under pixel sorting, slipping bands and channel split. |
 
 Pattern items can be built-in shapes (circle, cross, square, polygon, squircle, lines, star, heart), images (PNG, JPG,
 SVG and more, plus built-in SVG presets) or any other OBS source. Up to 32 items can be layered, alternated in a step
@@ -31,6 +38,14 @@ stair-step look, and the whole pattern can be rotated. The text can be a solid c
 along each word, or tone-on-tone (darkening or lightening whatever is behind it), filled or as outlines only. As a
 source it draws over a solid, linear or radial gradient background, or a transparent one; as a filter it draws over
 the filtered source.
+
+**Palettes.** Add a **Constellations Palette** source (it draws a swatch card, and can stay hidden) and pick it under
+**Palette** in any Constellations source, filter or transition. Its colors then replace the ones set there, so one
+edit restyles everything that uses it. It holds a background and five colors, mapped as follows. Backgrounds use the
+background color, and gradient ends use it at half brightness. Pattern items cycle through the five colors. Blueprint
+lines and Text Tiles use Colors 1 and 2. Ink and glitch tints use Color 1. **Time of Day Drift** blends to a night
+set, either the day colors dimmed or a custom set, between the sunset and sunrise hours you choose, by the computer's
+clock. **Preview Hour** shows any hour while you design.
 
 The transitions are generated on the GPU with no bundled video; add them in OBS under **Scene Transitions → +**. See
 [docs/transitions.md](docs/transitions.md) for every transition's settings.
