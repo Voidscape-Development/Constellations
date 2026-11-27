@@ -365,6 +365,77 @@ through.
 The envelope that scales every effect is zero on the first and last frame, and
 the swap threshold runs from 0 to 1, so both ends are exactly one scene.
 
+## Liquid Ripple Transition
+
+A drop lands and a ring front runs out from it. The incoming scene fills in
+behind the front, and the rings riding on it refract both scenes and catch a
+highlight.
+
+| Setting | What it does |
+| --- | --- |
+| **Drop X/Y** | Where the drop lands, −50% to 150%. |
+| **Easing** | How the front moves over the transition. |
+| **Wavelength** / **Refraction** | The spacing of the rings, and how far they bend the picture at their crests. |
+| **Ring Fade** | How far ahead of and behind the front the rings reach before they die out. |
+| **Front Softness** | The width of the blend between the scenes at the front. |
+| **Highlight** / **Highlight Color** / **Palette** | The sheen on the ring crests, taken from a palette's Color 1 if one is chosen. |
+
+The front runs from short of the drop to past the furthest corner, and the
+rings are scaled by an envelope that is zero on the first and last frame, so
+both ends are exactly one scene.
+
+## Black Hole Transition
+
+A singularity opens on the outgoing scene, lensing and swirling it in around a
+glowing photon ring until its horizon has swallowed the canvas. The incoming
+scene is then thrown back out the same way.
+
+| Setting | What it does |
+| --- | --- |
+| **Singularity X/Y** | Where the hole opens, −50% to 150%. |
+| **Lensing** | How hard the picture is pulled in round the horizon. Above 100% the picture near the hole flips over into an Einstein ring. |
+| **Swirl (turns)** | How far the picture winds round the hole at its strongest; negative turns the other way. |
+| **Photon Ring Glow** / **Glow Color** / **Palette** | The ring of light just outside the horizon, taken from a palette's Color 1 if one is chosen. |
+| **Horizon Color** | The inside of the hole. |
+
+The horizon's radius is zero on the first and last frame and every effect
+scales with it. At the midpoint, where the scenes swap, it reaches past every
+corner, so the swap is never seen.
+
+## Text Crawl Transition
+
+The canvas is cut into rows, and a ticker bar carrying your text slides along
+each one, rows staggered. The outgoing scene is ahead of the bar and the
+incoming one behind it. The text is laid out with Qt like Text Tiles, so any
+installed font works.
+
+| Setting | What it does |
+| --- | --- |
+| **Text** / **Uppercase** / **Font** / **Letter Spacing** | The phrase repeated along each bar. |
+| **Separator** / **Word Gap** | Drawn between repeats (such as • or ★), with this much space either side as a share of the text height. |
+| **Rows** / **Direction** | How many rows, and whether the bars run left to right, right to left, or alternate. |
+| **Row Offset** / **Row Shift** / **Seed** | Where each row's text starts: a seeded random point, a stair-step of this share of a repeat per row (50% gives a brick pattern), or aligned. |
+| **Text Drift** / **Drift Variation** | How far the text slides along its bar over the transition, as a share of the canvas width, and how much each row's pace differs so the rows slide past each other. |
+| **Easing** / **Stagger** | How each bar moves, and how long the last row waits after the first. |
+| **Bar Length** / **Text Size** | Each bar's length as a share of the canvas width, and the text's height as a share of the row. |
+| **Bar Color** / **Text Color** / **Palette** | Or a palette's background for the bars and Color 1 for the text. |
+
+Every row's bar starts just off the canvas and ends just past it, and the
+stagger is taken out of each row's own time, so both ends are exactly one
+scene.
+
+## Text Cover Transition
+
+Text Crawl's sibling: each row's bar is a whole line. The lines slide in until
+they cover the canvas, hold while the scenes swap underneath, then slide on out
+the other side, leaving the incoming scene behind them.
+
+It has Text Crawl's settings, with **Hold** in place of **Bar Length**: how
+long the lines cover the screen, as a share of the transition. Text Drift is on
+by default here, so the held screen keeps moving. Stagger applies
+to the slide in and the slide out separately, so every row is in place for the
+whole hold.
+
 ## How the transitions are tested
 
 CI runs every suite below on each pull request: the CPU tests directly, and the GPU checks on a software rasteriser

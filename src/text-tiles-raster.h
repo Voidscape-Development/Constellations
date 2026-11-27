@@ -17,6 +17,18 @@ the Free Software Foundation; either version 2 of the License, or
 extern "C" {
 #endif
 
+/* How far, in canvas px, the distance fields reach either side of an edge.
+ * Half the widest outline plus a pixel for its anti-aliasing must fit. */
+#define CTT_SDF_SPREAD 12.0f
+
+#if defined(_WIN32)
+#define CTT_DEFAULT_FACE "Arial"
+#elif defined(__APPLE__)
+#define CTT_DEFAULT_FACE "Helvetica"
+#else
+#define CTT_DEFAULT_FACE "Sans Serif"
+#endif
+
 /* Lays out and rasterizes one line of text with Qt, which finds the font the
  * OBS font picker names on every platform and shapes the text (kerning,
  * complex scripts, fallback fonts for missing characters). The result is a

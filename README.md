@@ -23,6 +23,10 @@ Animated pattern backgrounds, borders, overlays and scene transitions for [OBS S
 | **Tile Mosaic** | Filter | Redraws a source as flat tiles on any of the tiling transition's lattices, with grout and bevel. |
 | **Ink Bleed Transition** | Transition | Ink spreads from one or more drops with wet tendril edges, optionally flooding the canvas first. |
 | **Pixel Sort / Glitch Transition** | Transition | The scenes swap block by block under pixel sorting, slipping bands and channel split. |
+| **Liquid Ripple Transition** | Transition | A drop lands and a ring front runs out, refracting both scenes, with the incoming one filling in behind it. |
+| **Black Hole Transition** | Transition | A singularity lenses and swirls the outgoing scene into its horizon, then throws the incoming one back out. |
+| **Text Crawl Transition** | Transition | Ticker bars carrying your text slide along staggered rows, wiping to the incoming scene behind them. |
+| **Text Cover Transition** | Transition | Full lines of your text slide in to cover the screen, hold while the scenes swap, and slide out the other side. |
 
 Pattern items can be built-in shapes (circle, cross, square, polygon, squircle, lines, star, heart), images (PNG, JPG,
 SVG and more, plus built-in SVG presets) or any other OBS source. Up to 32 items can be layered, alternated in a step
@@ -43,7 +47,7 @@ the filtered source.
 **Palette** in any Constellations source, filter or transition. Its colors then replace the ones set there, so one
 edit restyles everything that uses it. It holds a background and five colors, mapped as follows. Backgrounds use the
 background color, and gradient ends use it at half brightness. Pattern items cycle through the five colors. Blueprint
-lines and Text Tiles use Colors 1 and 2. Ink and glitch tints use Color 1. **Time of Day Drift** blends to a night
+lines and Text Tiles use Colors 1 and 2. Ink, glitch, ripple highlight and black hole glow tints use Color 1; Text Crawl and Text Cover bars use the background and their text Color 1. **Time of Day Drift** blends to a night
 set, either the day colors dimmed or a custom set, between the sunset and sunrise hours you choose, by the computer's
 clock. **Preview Hour** shows any hour while you design.
 

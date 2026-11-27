@@ -360,6 +360,36 @@ static void check_ink_flood(void)
 	obs_source_release(transition);
 }
 
+/* The black hole's horizon has swallowed the whole canvas at the midpoint. */
+static void check_blackhole_swallow(void)
+{
+	obs_source_t *transition = make_transition("constellations_blackhole_transition", NULL);
+
+	if (!transition)
+		return;
+	begin(transition);
+	render_at(transition, 0.5f);
+	check(share_of(0, 0, 0) > 0.99, "black hole: the midpoint is only %.4f horizon", share_of(0, 0, 0));
+	obs_transition_set(transition, scene_a);
+	obs_source_release(transition);
+}
+
+#ifdef CONSTELLATIONS_HAS_QT
+/* Text Cover's lines cover the whole canvas while it holds. */
+static void check_cover_hold(void)
+{
+	obs_source_t *transition = make_transition("constellations_cover_transition", NULL);
+
+	if (!transition)
+		return;
+	begin(transition);
+	render_at(transition, 0.5f);
+	check(share_of(255, 0, 0) + share_of(0, 0, 255) < 0.01, "text cover: the hold is not all covered");
+	obs_transition_set(transition, scene_a);
+	obs_source_release(transition);
+}
+#endif
+
 /* Renders a source on its own and reads back the frame. */
 static void render_source(obs_source_t *source)
 {
@@ -545,9 +575,14 @@ static void check_matte_images(const char *mask_path)
 int main(int argc, char **argv)
 {
 	static const char *ids[] = {
-		"voidscape_tiles_transition",       "voidscape_vortex_transition", "voidscape_glass_transition",
-		"voidscape_matte_transition",       "voidscape_portal_transition", "constellations_ink_transition",
-		"constellations_glitch_transition",
+		"voidscape_tiles_transition",          "voidscape_vortex_transition",
+		"voidscape_glass_transition",          "voidscape_matte_transition",
+		"voidscape_portal_transition",         "constellations_ink_transition",
+		"constellations_glitch_transition",    "constellations_ripple_transition",
+		"constellations_blackhole_transition",
+#ifdef CONSTELLATIONS_HAS_QT
+		"constellations_crawl_transition",     "constellations_cover_transition",
+#endif
 	};
 	static const struct preset_case presets[] = {
 		{"voidscape_glass_transition", "gravity"},
@@ -609,6 +644,10 @@ int main(int argc, char **argv)
 		check_presets(&presets[i]);
 
 	check_ink_flood();
+	check_blackhole_swallow();
+#ifdef CONSTELLATIONS_HAS_QT
+	check_cover_hold();
+#endif
 	check_palette();
 
 	if (write_mask(mask_path))

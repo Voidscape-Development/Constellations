@@ -1,0 +1,76 @@
+/*
+ * Constellations - Black Hole transition.
+ *
+ * A singularity opens on the outgoing scene, lensing and swirling it in
+ * around a glowing photon ring, until its horizon has swallowed the canvas.
+ * The incoming scene is then thrown back out the same way. The horizon's
+ * radius is zero on the first and last frame, and every effect scales with
+ * it, so those frames are the two scenes exactly.
+ */
+
+uniform float4x4 ViewProj;
+uniform texture2d a_tex;
+uniform texture2d b_tex;
+
+uniform float2 canvas;
+uniform float2 centre;   /* px */
+uniform float horizon;   /* px, radius of the event horizon */
+uniform float feather;   /* px, the horizon's soft edge */
+uniform float strength;  /* 0..1, how far into the pull we are */
+uniform float lens;      /* horizon radii squared the image is pulled in by */
+uniform float swirl;     /* radians of turn at the horizon at full strength */
+uniform float glow;
+uniform float stage;     /* 0 the outgoing scene, 1 the incoming one */
+uniform float4 glow_color;
+uniform float4 horizon_color;
+
+sampler_state textureSampler {
+	Filter   = Linear;
+	AddressU = Clamp;
+	AddressV = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData v_out;
+	v_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	v_out.uv  = v_in.uv;
+	return v_out;
+}
+
+float4 PSBlackHole(VertData v_in) : TARGET
+{
+	float2 d = v_in.uv * canvas - centre;
+	float r = max(length(d), 0.0001);
+	float2 dir = d / r;
+
+	/* lensing pulls each pixel's source point in toward the singularity */
+	float pull = r - lens * horizon * horizon / r;
+	float a = swirl * strength * pow(saturate(horizon / r), 1.5);
+	float2 rot = float2(dir.x * cos(a) - dir.y * sin(a), dir.x * sin(a) + dir.y * cos(a));
+	float2 at = (centre + rot * pull) / canvas;
+	float4 c = stage < 0.5 ? a_tex.SampleLevel(textureSampler, at, 0.0) : b_tex.SampleLevel(textureSampler, at, 0.0);
+
+	/* the photon ring, streaked as it spins */
+	float ring_r = horizon * 1.18;
+	float ring_w = horizon * 0.07 + 1.5;
+	float streak = 0.7 + 0.3 * sin(atan2(dir.y, dir.x) * 5.0 + a * 3.0);
+	float ring = exp(-pow((r - ring_r) / ring_w, 2.0)) * streak + 0.35 * exp(-(r - horizon) / (horizon * 0.6 + 1.0));
+	c.rgb += glow_color.rgb * glow * strength * ring;
+
+	return lerp(float4(horizon_color.rgb, 1.0), c, smoothstep(horizon - feather, horizon, r));
+}
+
+technique BlackHole
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSBlackHole(v_in);
+	}
+}

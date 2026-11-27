@@ -31,6 +31,12 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 extern struct obs_source_info ink_transition;
 extern struct obs_source_info glitch_transition;
+extern struct obs_source_info ripple_transition;
+extern struct obs_source_info blackhole_transition;
+#ifdef CONSTELLATIONS_HAS_QT
+extern struct obs_source_info crawl_transition;
+extern struct obs_source_info cover_transition;
+#endif
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
@@ -66,6 +72,12 @@ bool obs_module_load(void)
 	obs_register_source(&portal_transition);
 	obs_register_source(&ink_transition);
 	obs_register_source(&glitch_transition);
+	obs_register_source(&ripple_transition);
+	obs_register_source(&blackhole_transition);
+#ifdef CONSTELLATIONS_HAS_QT
+	obs_register_source(&crawl_transition);
+	obs_register_source(&cover_transition);
+#endif
 	obs_log(LOG_INFO, "Constellations loaded");
 	return true;
 }
