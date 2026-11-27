@@ -16,6 +16,7 @@ uniform float4x4 ViewProj;
 uniform texture2d a_tex;
 uniform texture2d b_tex;
 uniform texture2d text_sdf;    /* R16: 0.5 - distance / (2 * spread) */
+uniform texture2d sep_sdf;
 
 uniform float2 canvas;
 uniform float progress;
@@ -28,9 +29,18 @@ uniform float direction;       /* 0 left to right, 1 right to left, 2 alternate 
 uniform float has_text;
 uniform float2 text_size;      /* phrase layout box, layout px */
 uniform float4 text_rect;      /* the field's x, y, width, height in that box */
+uniform float has_sep;
+uniform float2 sep_size;       /* separator layout box, layout px */
+uniform float4 sep_rect;
+uniform float sep_x;           /* where the separator's box starts in the period */
 uniform float period;          /* layout px from one phrase to the next */
 uniform float text_scale;      /* canvas px per layout px */
 uniform float sdf_spread;
+uniform float offset_mode;     /* 0 random, 1 stagger, 2 none */
+uniform float offset;          /* stagger: share of a period each row shifts */
+uniform float seed;
+uniform float drift;           /* px the text moves along its bar over the transition */
+uniform float drift_var;       /* 0..1, how much each row's drift differs */
 uniform float4 bar_color;
 uniform float4 text_color;
 
@@ -62,14 +72,33 @@ float ease(float t)
 	return t;
 }
 
-/* Coverage of the phrase at p, in layout px. */
+float row_hash(float row, float salt)
+{
+	return frac(sin(dot(float2(row, seed + salt), float2(12.9898, 78.233))) * 43758.5453);
+}
+
+float sd_cover(float v)
+{
+	return saturate(0.5 - (0.5 - v) * 2.0 * sdf_spread * text_scale);
+}
+
+bool outside(float2 uv)
+{
+	return uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0;
+}
+
+/* Coverage of the phrase or the separator at p, in layout px. One function
+ * per texture: OBS's GLSL translation only samples a texture named directly. */
 float text_cover(float2 p)
 {
 	float2 uv = (p - text_rect.xy) / text_rect.zw;
-	if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0)
-		return 0.0;
-	float sd = (0.5 - text_sdf.SampleLevel(textureSampler, uv, 0.0).r) * 2.0 * sdf_spread;
-	return saturate(0.5 - sd * text_scale);
+	return outside(uv) ? 0.0 : sd_cover(text_sdf.SampleLevel(textureSampler, uv, 0.0).r);
+}
+
+float sep_cover(float2 p)
+{
+	float2 uv = (p - float2(sep_x, 0.5 * (text_size.y - sep_size.y)) - sep_rect.xy) / sep_rect.zw;
+	return has_sep < 0.5 || outside(uv) ? 0.0 : sd_cover(sep_sdf.SampleLevel(textureSampler, uv, 0.0).r);
 }
 
 float4 PSCrawl(VertData v_in) : TARGET
@@ -97,11 +126,14 @@ float4 PSCrawl(VertData v_in) : TARGET
 	float4 b = b_tex.SampleLevel(textureSampler, v_in.uv, 0.0);
 	float4 bar = bar_color;
 	if (has_text > 0.5) {
-		/* the phrase rides on the bar, each row's copies set off by their own amount */
-		float gx = (back ? lead - x : x - lead) / text_scale + frac(sin(row * 12.9898) * 43758.5453) * period;
+		/* the phrase rides on the bar, each row set off by the row offset and
+		 * drifting along it at its own pace */
+		float shift = offset_mode < 0.5 ? row_hash(row, 0.0) : (offset_mode < 1.5 ? frac(row * offset) : 0.0);
+		float d = drift * progress * (1.0 + drift_var * (2.0 * row_hash(row, 7.0) - 1.0));
+		float gx = ((back ? lead - x : x - lead) - (back ? -d : d)) / text_scale + shift * period;
 		float2 g = float2(gx - floor(gx / period) * period,
 				  (px.y - (row + 0.5) * row_h) / text_scale + 0.5 * text_size.y);
-		bar = lerp(bar, text_color, text_cover(g));
+		bar = lerp(bar, text_color, max(text_cover(g), sep_cover(g)));
 	}
 
 	float4 c = lerp(a, bar, saturate(lead - x + 0.5));
