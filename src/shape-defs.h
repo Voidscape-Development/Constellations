@@ -103,7 +103,6 @@ enum constellations_border_layout {
 #define CONSTELLATIONS_MAX_ITEMS 32
 
 void constellations_register_pattern_source(void);
-void constellations_register_skylines(void);
 void constellations_register_blueprint(void);
 void constellations_register_pattern_filter(void);
 void constellations_register_pattern_border(void);
