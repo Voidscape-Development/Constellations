@@ -327,12 +327,18 @@ static void crawl_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_string(settings, "text", "BE RIGHT BACK");
 	obs_data_set_default_string(settings, "separator", "\xE2\x98\x85");
-	obs_data_t *font = obs_data_create();
-	obs_data_set_default_string(font, "face", CTT_DEFAULT_FACE);
-	obs_data_set_default_string(font, "style", "Bold");
-	obs_data_set_default_int(font, "size", 96);
-	obs_data_set_default_int(font, "flags", OBS_FONT_BOLD);
-	obs_data_set_default_obj(settings, "font", font);
+	/* OBS's transition properties window creates a preview clone on the
+	 * same settings, which runs this again. Replacing the default font
+	 * object there leaves the new one freed, so set it only once. */
+	obs_data_t *font = obs_data_get_default_obj(settings, "font");
+	if (!font) {
+		font = obs_data_create();
+		obs_data_set_default_string(font, "face", CTT_DEFAULT_FACE);
+		obs_data_set_default_string(font, "style", "Bold");
+		obs_data_set_default_int(font, "size", 96);
+		obs_data_set_default_int(font, "flags", OBS_FONT_BOLD);
+		obs_data_set_default_obj(settings, "font", font);
+	}
 	obs_data_release(font);
 	obs_data_set_default_double(settings, "word_gap", 40.0);
 	obs_data_set_default_int(settings, "rows", 4);

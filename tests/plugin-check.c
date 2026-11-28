@@ -637,6 +637,13 @@ int main(int argc, char **argv)
 
 		snprintf(what, sizeof(what), "%s at its defaults", ids[i]);
 		check_ends(transition, what);
+
+		/* OBS's properties window previews a clone made on the same
+		 * settings, which runs the defaults over them a second time */
+		obs_data_t *settings = obs_source_get_settings(transition);
+		obs_source_t *clone = make_transition(ids[i], settings);
+		obs_data_release(settings);
+		obs_source_release(clone);
 		obs_source_release(transition);
 	}
 
